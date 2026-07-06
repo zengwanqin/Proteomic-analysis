@@ -1,0 +1,795 @@
+############################################################
+## Figure 3
+## Glioma malignant progression is accompanied by a
+## longitudinal shift toward the IMR state
+##
+## Required upstream objects / files:
+##   1. sample_info.txt
+##   2. protein_matrix.txt
+##   3. Fig2_program_scores_SPS_IMS_SSIprog.csv
+##   4. Fig2_centroid_projection_full_cohort.csv
+##
+## Main terms:
+##   SYN: synaptic/neural state
+##   IMR: inflammatory-matrix-remodeling state
+##   SPS: synaptic program score
+##   IMS: inflammatory-matrix remodeling score
+##   SSIprog = SPS - IMS
+############################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(ggalluvial)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(scales)
+  library(ggpubr)
+  library(survival)
+  library(survminer)
+  library(patchwork)
+})
+
+set.seed(123)
+
+############################################################
+## 0. Paths
+############################################################
+
+ROOT_DIR <- normalizePath(".", mustWork = FALSE)
+
+DATA_DIR <- file.path(ROOT_DIR, "data")
+META_DIR <- file.path(DATA_DIR, "metadata")
+PROC_DIR <- file.path(DATA_DIR, "processed")
+
+FIG2_TBL_DIR <- file.path(ROOT_DIR, "results", "tables", "Fig2")
+
+OUT_TBL_DIR <- file.path(ROOT_DIR, "results", "tables", "Fig3")
+OUT_FIG_DIR <- file.path(ROOT_DIR, "results", "figures", "Fig3")
+
+dir.create(OUT_TBL_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(OUT_FIG_DIR, recursive = TRUE, showWarnings = FALSE)
+
+PATH_META <- file.path(META_DIR, "sample_info.txt")
+PATH_MAT  <- file.path(PROC_DIR, "protein_matrix.txt")
+
+PATH_PROG <- file.path(FIG2_TBL_DIR, "Fig2_program_scores_SPS_IMS_SSIprog.csv")
+PATH_PRED <- file.path(FIG2_TBL_DIR, "Fig2_centroid_projection_full_cohort.csv")
+
+############################################################
+## 1. Basic functions
+############################################################
+
+gene_symbol <- function(x) {
+  x <- as.character(x)
+  x <- ifelse(grepl("_", x), sub("^.*_", "", x), x)
+  x <- sub("\\|.*$", "", x)
+  x <- sub("\\..*$", "", x)
+  toupper(trimws(x))
+}
+
+safe_num <- function(x) {
+  suppressWarnings(as.numeric(as.character(x)))
+}
+
+first_non_na <- function(x) {
+  x <- x[!is.na(x) & x != ""]
+  if (length(x) == 0) NA else x[1]
+}
+
+pick_unique <- function(x, prefer = c("max", "min", "first")[1]) {
+  u <- unique(na.omit(safe_num(x)))
+  if (length(u) == 0) return(NA_real_)
+  if (length(u) == 1) return(u[1])
+  switch(prefer, max = max(u), min = min(u), first = u[1])
+}
+
+infer_region <- function(x) {
+  x <- as.character(x)
+  dplyr::case_when(
+    stringr::str_detect(x, "^Chnsrmyy") ~ "TC",
+    stringr::str_detect(x, "^Bhnsrmyy") ~ "TE",
+    stringr::str_detect(x, "^Nhnsrmyy") ~ "AB",
+    TRUE ~ "Unknown"
+  )
+}
+
+infer_timepoint_from_sample <- function(x) {
+  x <- as.character(x)
+  dplyr::case_when(
+    stringr::str_detect(x, "hnsrmyy1") ~ "Primary",
+    stringr::str_detect(x, "hnsrmyy2") ~ "Recurrent",
+    stringr::str_detect(x, "hnsrmyy3") ~ "Recurrent",
+    TRUE ~ "Unknown"
+  )
+}
+
+normalize_timepoint <- function(x) {
+  x <- as.character(x)
+  dplyr::case_when(
+    x %in% c("Primary", "primary", "C1", "初发", "初诊", "Pr") ~ "Primary",
+    x %in% c("Recurrent", "recurrent", "C2", "C3", "复发", "进展", "Re") ~ "Recurrent",
+    TRUE ~ NA_character_
+  )
+}
+
+normalize_idh <- function(x) {
+  x0 <- tolower(as.character(x))
+  dplyr::case_when(
+    stringr::str_detect(x0, "mut|突变") ~ "IDH-mutant",
+    stringr::str_detect(x0, "wt|wild|野生") ~ "IDH-wildtype",
+    TRUE ~ "Unknown"
+  )
+}
+
+save_pdf_png <- function(plot, filename, width = 5, height = 4) {
+  ggsave(
+    file.path(OUT_FIG_DIR, paste0(filename, ".pdf")),
+    plot,
+    width = width,
+    height = height,
+    useDingbats = FALSE
+  )
+  ggsave(
+    file.path(OUT_FIG_DIR, paste0(filename, ".png")),
+    plot,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+}
+
+theme_pub <- function(base_size = 11) {
+  theme_classic(base_size = base_size) +
+    theme(
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(face = "bold"),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6),
+      plot.title = element_text(face = "bold", hjust = 0),
+      legend.title = element_text(face = "bold")
+    )
+}
+
+############################################################
+## 2. Colours
+############################################################
+
+sub_cols <- c(
+  SYN   = "#D62728",
+  IMR   = "#1F77B4",
+  Mixed = "#00A037"
+)
+
+time_cols <- c(
+  Primary   = "#2C7FB8",
+  Recurrent = "#D7301F"
+)
+
+idh_cols <- c(
+  "IDH-mutant"   = "#7E57C2",
+  "IDH-wildtype" = "#26A69A",
+  "Unknown"      = "#BDBDBD"
+)
+
+trajectory_cols <- c(
+  "SYN→SYN"     = "#D62728",
+  "SYN→IMR"     = "#FF7F0E",
+  "IMR→IMR"     = "#1F77B4",
+  "IMR→SYN"     = "#9467BD",
+  "SYN→Mixed"   = "#BDBDBD",
+  "IMR→Mixed"   = "#9E9E9E",
+  "Mixed→SYN"   = "#8DD3C7",
+  "Mixed→IMR"   = "#80B1D3",
+  "Mixed→Mixed" = "#7F7F7F",
+  Other         = "#7F7F7F"
+)
+
+############################################################
+## 3. Load metadata and Fig2 outputs
+############################################################
+
+meta_all <- read.table(
+  PATH_META,
+  sep = "\t",
+  header = TRUE,
+  row.names = 1,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+prog_df <- read.csv(PATH_PROG, stringsAsFactors = FALSE)
+pred_df <- read.csv(PATH_PRED, stringsAsFactors = FALSE)
+
+## Standardize metadata
+meta_std <- meta_all %>%
+  mutate(
+    Sample = if ("编号" %in% names(.)) 编号 else rownames(.),
+    PatientID = if ("PatientID" %in% names(.)) PatientID else 姓名,
+    Region_raw = if ("TissueRegion" %in% names(.)) TissueRegion else NA_character_,
+    Region = case_when(
+      Region_raw %in% c("C", "Center", "TC", "Tumor core") ~ "TC",
+      Region_raw %in% c("B", "E", "Edge", "TE", "Tumor edge") ~ "TE",
+      Region_raw %in% c("N", "Normal", "AB", "Adjacent brain") ~ "AB",
+      TRUE ~ infer_region(Sample)
+    ),
+    TimePoint_raw = if ("TimePoint" %in% names(.)) TimePoint else NA_character_,
+    TimePoint = normalize_timepoint(TimePoint_raw),
+    TimePoint = ifelse(is.na(TimePoint), infer_timepoint_from_sample(Sample), TimePoint),
+    IDH_raw = if ("IDHStatus" %in% names(.)) IDHStatus else if ("分子状态" %in% names(.)) 分子状态 else NA_character_,
+    IDH = normalize_idh(IDH_raw),
+    Progress_time = if ("进展时间（天）" %in% names(.)) safe_num(`进展时间（天）`) else if ("Progress_time" %in% names(.)) safe_num(Progress_time) else NA_real_,
+    Survival_time = if ("生存时间" %in% names(.)) safe_num(生存时间) else if ("Survival_time" %in% names(.)) safe_num(Survival_time) else NA_real_
+  ) %>%
+  dplyr::select(
+    Sample, PatientID, Region, TimePoint, IDH,
+    Progress_time, Survival_time, everything()
+  )
+
+## Standardize Fig2 outputs
+pred_df <- pred_df %>%
+  mutate(
+    PredSubtype = recode(
+      as.character(PredSubtype),
+      ICE = "IMR",
+      Mixed_subtype = "Mixed",
+      .default = as.character(PredSubtype)
+    ),
+    PredSubtype = factor(PredSubtype, levels = c("SYN", "IMR", "Mixed")),
+    Region = ifelse(is.na(Region), infer_region(Sample), Region)
+  )
+
+prog_df <- prog_df %>%
+  mutate(
+    PredSubtype = recode(
+      as.character(PredSubtype),
+      ICE = "IMR",
+      Mixed_subtype = "Mixed",
+      .default = as.character(PredSubtype)
+    ),
+    PredSubtype = factor(PredSubtype, levels = c("SYN", "IMR", "Mixed")),
+    Region = ifelse(is.na(Region), infer_region(Sample), Region),
+    SSIprog = if ("SSIprog" %in% names(.)) SSIprog else SPS - IMS
+  )
+
+fig3_df <- prog_df %>%
+  dplyr::select(Sample, SPS, IMS, SSIprog, PredSubtype) %>%
+  left_join(
+    pred_df %>% dplyr::select(Sample, SSIcentroid, MaxR),
+    by = "Sample"
+  ) %>%
+  left_join(meta_std, by = "Sample") %>%
+  mutate(
+    Region = factor(Region, levels = c("TC", "TE", "AB", "Unknown")),
+    TimePoint = factor(TimePoint, levels = c("Primary", "Recurrent")),
+    IDH = factor(IDH, levels = c("IDH-mutant", "IDH-wildtype", "Unknown")),
+    PredSubtype = factor(PredSubtype, levels = c("SYN", "IMR", "Mixed"))
+  )
+
+write.csv(
+  fig3_df,
+  file.path(OUT_TBL_DIR, "Fig3_sample_level_scores_metadata.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 4. Construct matched primary-recurrent TC pairs
+############################################################
+
+tc_unique <- fig3_df %>%
+  filter(
+    Region == "TC",
+    TimePoint %in% c("Primary", "Recurrent"),
+    !is.na(PatientID),
+    !is.na(PredSubtype),
+    is.finite(SSIprog)
+  ) %>%
+  group_by(PatientID, TimePoint) %>%
+  arrange(desc(abs(SSIprog)), desc(abs(SSIcentroid)), .by_group = TRUE) %>%
+  slice_head(n = 1) %>%
+  ungroup()
+
+tc_pairs <- tc_unique %>%
+  dplyr::select(
+    PatientID, Sample, TimePoint, PredSubtype, SPS, IMS, SSIprog,
+    IDH, Progress_time, Survival_time
+  ) %>%
+  pivot_wider(
+    id_cols = PatientID,
+    names_from = TimePoint,
+    values_from = c(
+      Sample, PredSubtype, SPS, IMS, SSIprog,
+      IDH, Progress_time, Survival_time
+    ),
+    names_sep = "_"
+  ) %>%
+  filter(!is.na(Sample_Primary), !is.na(Sample_Recurrent)) %>%
+  mutate(
+    Subtype_Primary = as.character(PredSubtype_Primary),
+    Subtype_Recurrent = as.character(PredSubtype_Recurrent),
+    Transition = paste0(Subtype_Primary, "→", Subtype_Recurrent),
+    Transition = ifelse(Transition %in% names(trajectory_cols), Transition, "Other"),
+    Transition = factor(Transition, levels = names(trajectory_cols)),
+    delta_SPS = SPS_Recurrent - SPS_Primary,
+    delta_IMS = IMS_Recurrent - IMS_Primary,
+    delta_SSI = SSIprog_Recurrent - SSIprog_Primary,
+    IDH = coalesce(as.character(IDH_Primary), as.character(IDH_Recurrent), "Unknown"),
+    IDH = factor(IDH, levels = c("IDH-mutant", "IDH-wildtype", "Unknown"))
+  )
+
+write.csv(
+  tc_pairs,
+  file.path(OUT_TBL_DIR, "Fig3_matched_primary_recurrent_TC_pairs.csv"),
+  row.names = FALSE
+)
+
+tc_long <- tc_unique %>%
+  filter(PatientID %in% tc_pairs$PatientID) %>%
+  mutate(
+    TimePoint = factor(TimePoint, levels = c("Primary", "Recurrent")),
+    IDH = factor(IDH, levels = c("IDH-mutant", "IDH-wildtype", "Unknown"))
+  )
+
+############################################################
+## 5. Figure 3A: swimmer plot
+############################################################
+
+timeline_pts <- meta_std %>%
+  filter(
+    TimePoint %in% c("Primary", "Recurrent"),
+    !is.na(PatientID)
+  ) %>%
+  group_by(PatientID, TimePoint) %>%
+  summarise(
+    IDH = first_non_na(IDH),
+    Progress_month = ifelse(TimePoint[1] == "Primary", 0, pick_unique(Progress_time, prefer = "max") / 30.44),
+    .groups = "drop"
+  ) %>%
+  filter(PatientID %in% tc_pairs$PatientID) %>%
+  mutate(
+    Progress_month = ifelse(TimePoint == "Primary", 0, Progress_month),
+    TimePoint = factor(TimePoint, levels = c("Primary", "Recurrent")),
+    IDH = factor(IDH, levels = c("IDH-mutant", "IDH-wildtype", "Unknown"))
+  )
+
+timeline_seg <- timeline_pts %>%
+  group_by(PatientID) %>%
+  summarise(
+    x_start = 0,
+    x_end = max(Progress_month, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(x_end, PatientID)
+
+timeline_pts <- timeline_pts %>%
+  mutate(PatientID_f = factor(PatientID, levels = timeline_seg$PatientID))
+
+timeline_seg <- timeline_seg %>%
+  mutate(PatientID_f = factor(PatientID, levels = timeline_seg$PatientID))
+
+p_fig3A <- ggplot() +
+  geom_segment(
+    data = timeline_seg,
+    aes(x = x_start, xend = x_end, y = PatientID_f, yend = PatientID_f),
+    colour = "black",
+    linewidth = 0.55
+  ) +
+  geom_point(
+    data = timeline_pts,
+    aes(x = Progress_month, y = PatientID_f, colour = TimePoint, shape = IDH),
+    size = 2.8
+  ) +
+  scale_colour_manual(values = time_cols, name = "Sampling") +
+  scale_shape_manual(values = c("IDH-mutant" = 17, "IDH-wildtype" = 16, "Unknown" = 15)) +
+  labs(
+    x = "Progression-free survival, months",
+    y = "Patient",
+    title = "Figure 3A. Matched primary and recurrent sampling timeline"
+  ) +
+  theme_pub(11) +
+  theme(panel.grid.major.y = element_blank())
+
+save_pdf_png(p_fig3A, "Fig3A_swimmer_matched_primary_recurrent_TC", width = 7, height = 5)
+
+############################################################
+## 6. Figure 3B: Sankey transition in discovery cohort
+############################################################
+## ggalluvial is suitable for visualizing categorical transitions over time;
+## geom_flow / geom_stratum are used for flow ribbons and strata.
+
+alluvial_main <- tc_long %>%
+  dplyr::select(PatientID, TimePoint, PredSubtype) %>%
+  mutate(
+    PredSubtype = factor(PredSubtype, levels = c("SYN", "IMR", "Mixed")),
+    TimePoint = factor(TimePoint, levels = c("Primary", "Recurrent"))
+  )
+
+p_fig3B <- ggplot(
+  alluvial_main,
+  aes(
+    x = TimePoint,
+    stratum = PredSubtype,
+    alluvium = PatientID,
+    fill = PredSubtype,
+    label = PredSubtype
+  )
+) +
+  geom_flow(alpha = 0.68, width = 0.28, colour = "grey75") +
+  geom_stratum(width = 0.28, colour = "black", linewidth = 0.35, alpha = 0.9) +
+  geom_text(stat = "stratum", size = 3.2, colour = "black") +
+  scale_fill_manual(values = sub_cols, drop = FALSE) +
+  labs(
+    x = NULL,
+    y = "Number of patients",
+    title = "Figure 3B. SYN–IMR state transition in matched TC samples",
+    fill = "State"
+  ) +
+  theme_pub(11)
+
+save_pdf_png(p_fig3B, "Fig3B_Sankey_TC_state_transition", width = 5.2, height = 4.3)
+
+transition_summary <- tc_pairs %>%
+  count(Transition) %>%
+  mutate(prop = n / sum(n))
+
+write.csv(
+  transition_summary,
+  file.path(OUT_TBL_DIR, "Fig3B_transition_summary.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 7. Figure 3C: paired SSIprog shift
+############################################################
+
+ssi_pair_stats <- tc_pairs %>%
+  summarise(
+    n_pair = n(),
+    mean_delta = mean(delta_SSI, na.rm = TRUE),
+    median_delta = median(delta_SSI, na.rm = TRUE),
+    n_shift_to_IMR = sum(delta_SSI < 0, na.rm = TRUE),
+    n_shift_to_SYN = sum(delta_SSI > 0, na.rm = TRUE),
+    prop_shift_to_IMR = n_shift_to_IMR / n_pair
+  )
+
+wilcox_3c <- wilcox.test(
+  tc_pairs$SSIprog_Recurrent,
+  tc_pairs$SSIprog_Primary,
+  paired = TRUE,
+  alternative = "two.sided",
+  exact = FALSE
+)
+
+write.csv(
+  bind_cols(ssi_pair_stats, tibble(p_wilcox = wilcox_3c$p.value)),
+  file.path(OUT_TBL_DIR, "Fig3C_paired_SSI_shift_statistics.csv"),
+  row.names = FALSE
+)
+
+p_label_3c <- paste0(
+  "ΔSSI = ", sprintf("%.2f", ssi_pair_stats$mean_delta),
+  "\nWilcoxon P = ", signif(wilcox_3c$p.value, 2)
+)
+
+y_max <- max(tc_long$SSIprog, na.rm = TRUE)
+y_min <- min(tc_long$SSIprog, na.rm = TRUE)
+y_pos <- y_max + 0.12 * (y_max - y_min)
+
+p_fig3C <- ggplot(tc_long, aes(x = TimePoint, y = SSIprog)) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey60", linewidth = 0.4) +
+  geom_boxplot(width = 0.35, outlier.shape = NA, fill = "white", colour = "black") +
+  geom_line(aes(group = PatientID), colour = "grey45", linetype = "dashed", alpha = 0.65) +
+  geom_point(aes(fill = TimePoint), shape = 21, size = 2.5, colour = "black", stroke = 0.35) +
+  geom_segment(aes(x = 1, xend = 2, y = y_pos, yend = y_pos), inherit.aes = FALSE, linewidth = 0.5) +
+  annotate("text", x = 1.5, y = y_pos, label = p_label_3c, vjust = -0.3, size = 3.1) +
+  scale_fill_manual(values = time_cols) +
+  scale_x_discrete(labels = c(Primary = "Primary", Recurrent = "Recurrent")) +
+  labs(
+    x = NULL,
+    y = "SSIprog = SPS − IMS",
+    title = "Figure 3C. Longitudinal SSIprog shift in matched TC samples"
+  ) +
+  theme_pub(11) +
+  theme(legend.position = "none")
+
+save_pdf_png(p_fig3C, "Fig3C_paired_SSIprog_shift_TC", width = 4.5, height = 4.2)
+
+############################################################
+## 8. Figure S4C-D-E-F: detailed ΔSPS / ΔIMS / ΔSSI dynamics
+############################################################
+
+delta_long <- tc_pairs %>%
+  dplyr::select(PatientID, Transition, IDH, delta_SPS, delta_IMS, delta_SSI, Subtype_Recurrent) %>%
+  pivot_longer(
+    cols = c(delta_SPS, delta_IMS, delta_SSI),
+    names_to = "Metric",
+    values_to = "Delta"
+  ) %>%
+  mutate(
+    Metric = recode(
+      Metric,
+      delta_SPS = "ΔSPS",
+      delta_IMS = "ΔIMS",
+      delta_SSI = "ΔSSI"
+    ),
+    Transition = factor(Transition, levels = names(trajectory_cols)),
+    Subtype_Recurrent = factor(Subtype_Recurrent, levels = c("SYN", "IMR", "Mixed"))
+  )
+
+write.csv(
+  delta_long,
+  file.path(OUT_TBL_DIR, "FigS4CDEF_delta_program_scores_by_trajectory.csv"),
+  row.names = FALSE
+)
+
+p_delta_by_traj <- function(metric_name, ylab, filename) {
+  dat <- delta_long %>% filter(Metric == metric_name)
+
+  p <- ggplot(dat, aes(x = Transition, y = Delta, fill = Transition)) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+    geom_violin(trim = FALSE, alpha = 0.35, colour = NA) +
+    geom_boxplot(width = 0.18, outlier.shape = NA, alpha = 0.9) +
+    geom_jitter(aes(colour = IDH), width = 0.08, size = 2, alpha = 0.85) +
+    scale_fill_manual(values = trajectory_cols, drop = FALSE) +
+    scale_colour_manual(values = idh_cols, drop = FALSE) +
+    labs(x = NULL, y = ylab, title = filename, colour = "IDH") +
+    theme_pub(10) +
+    theme(
+      legend.position = "right",
+      axis.text.x = element_text(angle = 35, hjust = 1)
+    )
+
+  save_pdf_png(p, filename, width = 5.5, height = 4.2)
+  p
+}
+
+p_s4c <- p_delta_by_traj("ΔSPS", "ΔSPS = SPSrecurrent − SPSprimary", "FigS4C_delta_SPS_by_trajectory")
+p_s4d <- p_delta_by_traj("ΔIMS", "ΔIMS = IMSrecurrent − IMSprimary", "FigS4D_delta_IMS_by_trajectory")
+
+## Figure S4E: ΔSSI according to recurrent subtype
+df_s4e <- tc_pairs %>%
+  filter(Subtype_Recurrent %in% c("SYN", "IMR")) %>%
+  mutate(Subtype_Recurrent = factor(Subtype_Recurrent, levels = c("SYN", "IMR")))
+
+wil_s4e <- wilcox.test(delta_SSI ~ Subtype_Recurrent, data = df_s4e, exact = FALSE)
+
+p_s4e <- ggplot(df_s4e, aes(x = Subtype_Recurrent, y = delta_SSI, fill = Subtype_Recurrent)) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey60") +
+  geom_violin(trim = FALSE, alpha = 0.4, colour = NA) +
+  geom_boxplot(width = 0.22, outlier.shape = NA, alpha = 0.9) +
+  geom_jitter(width = 0.08, size = 2, alpha = 0.85) +
+  stat_compare_means(method = "wilcox.test", label = "p.format") +
+  scale_fill_manual(values = sub_cols[c("SYN", "IMR")]) +
+  labs(
+    x = NULL,
+    y = "ΔSSI = SSIrecurrent − SSIprimary",
+    title = "Figure S4E. ΔSSI according to recurrent state"
+  ) +
+  theme_pub(10) +
+  theme(legend.position = "none")
+
+save_pdf_png(p_s4e, "FigS4E_delta_SSI_by_recurrent_state", width = 4.2, height = 4)
+
+## Figure S4F: IMR-retained vs SYN-to-IMR
+df_s4f <- tc_pairs %>%
+  filter(Subtype_Recurrent == "IMR", Transition %in% c("SYN→IMR", "IMR→IMR")) %>%
+  mutate(Transition = factor(Transition, levels = c("SYN→IMR", "IMR→IMR")))
+
+if (nrow(df_s4f) >= 3 && n_distinct(df_s4f$Transition) == 2) {
+  p_s4f <- ggplot(df_s4f, aes(x = Transition, y = delta_SSI, fill = Transition)) +
+    geom_hline(yintercept = 0, linetype = "dotted", colour = "grey60") +
+    geom_violin(trim = FALSE, alpha = 0.4, colour = NA) +
+    geom_boxplot(width = 0.22, outlier.shape = NA, alpha = 0.9) +
+    geom_jitter(aes(colour = IDH), width = 0.08, size = 2, alpha = 0.85) +
+    stat_compare_means(method = "wilcox.test", label = "p.format") +
+    scale_fill_manual(values = trajectory_cols[c("SYN→IMR", "IMR→IMR")]) +
+    scale_colour_manual(values = idh_cols) +
+    labs(
+      x = NULL,
+      y = "ΔSSI = SSIrecurrent − SSIprimary",
+      title = "Figure S4F. ΔSSI among recurrent IMR tumors",
+      colour = "IDH"
+    ) +
+    theme_pub(10) +
+    theme(legend.position = "right")
+
+  save_pdf_png(p_s4f, "FigS4F_delta_SSI_IMR_retained_vs_SYN_to_IMR", width = 4.5, height = 4)
+}
+
+############################################################
+## 9. Figure 3F: recurrent-minus-primary pathway-score heatmap
+############################################################
+
+## Use curated pathway genes. These should be replaced by the exact
+## final program signatures used in the manuscript.
+pathway_list <- list(
+  Inflammatory = c("PTPRC", "LCP2", "ITGAM", "CD68", "TYROBP", "CSF1R", "AIF1"),
+  Complement = c("C1QA", "C1QB", "C1QC", "C3", "C4A", "C4B", "C5", "C7", "C9", "CFB", "CFH"),
+  Matrix_remodeling = c("COL1A1", "COL1A2", "COL3A1", "COL4A1", "COL4A2", "LAMA4", "LAMB1", "FN1", "TNC", "VCAN", "SERPINH1"),
+  Synaptic = c("SYP", "SYN1", "SYN2", "SYT1", "SNAP25", "VAMP2", "STX1A", "STXBP1", "CAMK2A"),
+  Neuronal = c("MAP2", "TUBB3", "RBFOX3", "ENO2", "NEFL", "NEFM", "NEFH")
+)
+
+## Load matrix
+protein_raw <- read.table(PATH_MAT, header = TRUE, check.names = FALSE, stringsAsFactors = FALSE)
+
+sample_cols <- grep("^(Chnsrmyy|Bhnsrmyy|Nhnsrmyy)", colnames(protein_raw), value = TRUE)
+
+if (!colnames(protein_raw)[1] %in% sample_cols) {
+  rownames(protein_raw) <- protein_raw[[1]]
+  protein_raw <- protein_raw[, sample_cols, drop = FALSE]
+}
+
+protein_mat <- as.matrix(protein_raw)
+storage.mode(protein_mat) <- "double"
+rownames(protein_mat) <- gene_symbol(rownames(protein_mat))
+
+## collapse duplicated genes by highest variance
+if (any(duplicated(rownames(protein_mat)))) {
+  rv <- matrixStats::rowVars(protein_mat, na.rm = TRUE)
+  keep <- tibble(Gene = rownames(protein_mat), row = seq_len(nrow(protein_mat)), var = rv) %>%
+    group_by(Gene) %>%
+    slice_max(var, n = 1, with_ties = FALSE) %>%
+    ungroup()
+  protein_mat <- protein_mat[keep$row, , drop = FALSE]
+  rownames(protein_mat) <- keep$Gene
+}
+
+row_z <- function(M) {
+  Z <- t(scale(t(as.matrix(M))))
+  Z[!is.finite(Z)] <- NA
+  Z
+}
+
+Z <- row_z(protein_mat)
+
+mean_score <- function(Z, genes) {
+  genes <- intersect(gene_symbol(genes), rownames(Z))
+  if (length(genes) < 3) return(rep(NA_real_, ncol(Z)))
+  colMeans(Z[genes, , drop = FALSE], na.rm = TRUE)
+}
+
+pathway_scores <- map_dfc(pathway_list, ~ mean_score(Z, .x)) %>%
+  as.data.frame()
+
+colnames(pathway_scores) <- names(pathway_list)
+rownames(pathway_scores) <- colnames(Z)
+
+pair_samples <- tc_pairs %>%
+  dplyr::select(
+    PatientID,
+    Sample_Primary,
+    Sample_Recurrent,
+    Subtype_Recurrent,
+    delta_SSI
+  ) %>%
+  filter(Sample_Primary %in% rownames(pathway_scores),
+         Sample_Recurrent %in% rownames(pathway_scores))
+
+path_delta <- sapply(seq_len(nrow(pair_samples)), function(i) {
+  s_re <- pair_samples$Sample_Recurrent[i]
+  s_pr <- pair_samples$Sample_Primary[i]
+  as.numeric(pathway_scores[s_re, ] - pathway_scores[s_pr, ])
+})
+
+rownames(path_delta) <- colnames(pathway_scores)
+colnames(path_delta) <- paste0("Pt", pair_samples$PatientID)
+
+col_order <- pair_samples %>%
+  arrange(delta_SSI) %>%
+  mutate(col = paste0("Pt", PatientID))
+
+path_delta <- path_delta[, col_order$col, drop = FALSE]
+
+ha_col <- HeatmapAnnotation(
+  Recurrent_state = factor(col_order$Subtype_Recurrent, levels = c("SYN", "IMR", "Mixed")),
+  Delta_SSI = col_order$delta_SSI,
+  col = list(
+    Recurrent_state = sub_cols,
+    Delta_SSI = colorRamp2(
+      c(min(col_order$delta_SSI, na.rm = TRUE), 0, max(col_order$delta_SSI, na.rm = TRUE)),
+      c("#2166AC", "#F7F7F7", "#B2182B")
+    )
+  ),
+  annotation_name_side = "left"
+)
+
+max_abs <- max(abs(path_delta), na.rm = TRUE)
+
+ht_fig3F <- Heatmap(
+  path_delta,
+  name = "Δ score\n(Recurrent − Primary)",
+  col = colorRamp2(c(-max_abs, 0, max_abs), c("#2166AC", "#F7F7F7", "#B2182B")),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  top_annotation = ha_col,
+  show_column_names = FALSE,
+  column_title = "Figure 3F. Recurrent-minus-primary pathway-score changes"
+)
+
+pdf(file.path(OUT_FIG_DIR, "Fig3F_delta_pathway_score_heatmap.pdf"), width = 8, height = 3.8)
+draw(ht_fig3F, heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+
+write.csv(
+  as.data.frame(path_delta) %>% rownames_to_column("Pathway"),
+  file.path(OUT_TBL_DIR, "Fig3F_delta_pathway_score_matrix.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 10. Optional: Figure 3H mIF quantification
+############################################################
+## Input table format:
+##   PatientID, Marker, TimePoint, Intensity, IDH
+## Marker should include:
+##   CAMKII, SYP, SYN1, C3, SERPINA3, SERPINH1
+
+PATH_MIF <- file.path(META_DIR, "Fig3_mIF_quantification.csv")
+
+if (file.exists(PATH_MIF)) {
+  mif_df <- read.csv(PATH_MIF, stringsAsFactors = FALSE) %>%
+    mutate(
+      TimePoint = factor(TimePoint, levels = c("Primary", "Recurrent")),
+      Marker = factor(Marker, levels = c("CAMKII", "SYP", "SYN1", "C3", "SERPINA3", "SERPINH1"))
+    )
+
+  mif_stats <- mif_df %>%
+    group_by(Marker) %>%
+    summarise(
+      n_pair = n_distinct(PatientID),
+      p_paired_t = tryCatch(
+        t.test(
+          Intensity[TimePoint == "Recurrent"],
+          Intensity[TimePoint == "Primary"],
+          paired = TRUE
+        )$p.value,
+        error = function(e) NA_real_
+      ),
+      .groups = "drop"
+    )
+
+  write.csv(
+    mif_stats,
+    file.path(OUT_TBL_DIR, "Fig3H_mIF_paired_ttest_statistics.csv"),
+    row.names = FALSE
+  )
+
+  p_fig3H <- ggplot(mif_df, aes(x = TimePoint, y = Intensity)) +
+    geom_col(
+      data = mif_df %>%
+        group_by(Marker, TimePoint) %>%
+        summarise(mean_intensity = mean(Intensity, na.rm = TRUE), sd_intensity = sd(Intensity, na.rm = TRUE), .groups = "drop"),
+      aes(y = mean_intensity, fill = TimePoint),
+      width = 0.55,
+      alpha = 0.65
+    ) +
+    geom_errorbar(
+      data = mif_df %>%
+        group_by(Marker, TimePoint) %>%
+        summarise(mean_intensity = mean(Intensity, na.rm = TRUE), sd_intensity = sd(Intensity, na.rm = TRUE), .groups = "drop"),
+      aes(y = mean_intensity, ymin = mean_intensity - sd_intensity, ymax = mean_intensity + sd_intensity),
+      width = 0.18
+    ) +
+    geom_line(aes(group = PatientID), colour = "grey45", linetype = "dashed", alpha = 0.65) +
+    geom_point(size = 2, colour = "black") +
+    facet_wrap(~ Marker, scales = "free_y", nrow = 1) +
+    scale_fill_manual(values = time_cols) +
+    labs(
+      x = NULL,
+      y = "Mean fluorescence intensity",
+      title = "Figure 3H. Paired mIF quantification"
+    ) +
+    theme_pub(10) +
+    theme(legend.position = "none")
+
+  save_pdf_png(p_fig3H, "Fig3H_mIF_paired_quantification", width = 10, height = 3.5)
+}
+
+############################################################
+## 11. Session info
+############################################################
+
+sink(file.path(OUT_TBL_DIR, "Fig3_sessionInfo.txt"))
+sessionInfo()
+sink()
+
+message("Figure 3 main pipeline finished.")
