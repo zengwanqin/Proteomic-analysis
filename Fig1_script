@@ -214,8 +214,6 @@ normalize_grade <- function(x) {
     is.na(x) ~ NA_character_,
     stringr::str_detect(x, "4") ~ "Grade 4",
     stringr::str_detect(x, "3") ~ "Grade 3",
-    stringr::str_detect(x, "2") ~ "Grade 2",
-    stringr::str_detect(x, "1") ~ "Grade 1",
     TRUE ~ NA_character_
   )
 }
@@ -626,7 +624,7 @@ region_levels <- c("Non-glioma normal brain", "Adjacent brain", "Tumor core", "T
 time_levels   <- c("N/A", "Primary", "Recurrent", "Second recurrent")
 sex_levels    <- c("N/A", "Female", "Male")
 idh_context_levels <- c("N/A", "IDH-mutant glioma context", "IDH-wild-type glioma context")
-grade_levels  <- c("N/A", "Grade 1", "Grade 2", "Grade 3", "Grade 4")
+grade_levels  <- c("N/A",  "Grade 2", "Grade 3", "Grade 4")
 yesno_levels  <- c("N/A", "No", "Yes")
 
 fig1_anno <- fig1_anno %>%
@@ -712,7 +710,6 @@ col_list <- list(
   ),
   `WHO grade` = c(
     "N/A" = "#D9D9D9",
-    "Grade 1" = "#9E2F27",
     "Grade 2" = "#B52B86",
     "Grade 3" = "#B59930",
     "Grade 4" = "#7F1D1D"
@@ -1506,7 +1503,6 @@ p_umap_grade <- ggplot(umap_df, aes(UMAP1, UMAP2, color = who_grade_plot, shape 
   scale_color_manual(
     values = c(
       "N/A" = "#BDBDBD",
-      "Grade 1" = "#9E2F27",
       "Grade 2" = "#B52B86",
       "Grade 3" = "#B59930",
       "Grade 4" = "#7F1D1D"
