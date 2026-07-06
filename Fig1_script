@@ -1,1 +1,1596 @@
+#!/usr/bin/env Rscript
 
+## =========================================================
+## Figure 1 and Figure S1
+## Study design and clinicopathological characteristics
+## of the multi-region longitudinal glioma proteomic cohort
+##
+## Outputs:
+##   Figure 1B: sample-level clinicopathological annotation
+##   Figure 1C: patient-level distributions
+##   Figure 1D-E: OS/PFS Kaplan-Meier curves by IDH status
+##   Figure S1A: patient-level sampling map
+##   Figure S1B: WHO grade transition alluvial plot
+##   Figure S1C: quantified protein number per sample
+##   Figure S1D: missing-value rate by region
+##   Figure S1E-G: UMAP of global proteomic profiles
+##   Figure S1H-I: OS and TTP boxplots by IDH status
+## =========================================================
+
+options(stringsAsFactors = FALSE)
+
+## -----------------------------
+## 0. Project paths
+## -----------------------------
+suppressPackageStartupMessages({
+  library(here)
+})
+
+data_dir   <- here::here("data")
+meta_dir   <- file.path(data_dir, "metadata")
+proc_dir   <- file.path(data_dir, "processed")
+
+out_tbl_dir <- here::here("results", "tables", "Fig1")
+out_fig_dir <- here::here("results", "figures", "Fig1")
+
+dir.create(out_tbl_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+table1_file <- file.path(meta_dir, "Table1_region_samples.xlsx")
+table2_file <- file.path(meta_dir, "Table2_clinical.xlsx")
+protein_mat_file <- file.path(proc_dir, "protein_matrix.txt")
+
+stopifnot(file.exists(table1_file))
+stopifnot(file.exists(table2_file))
+stopifnot(file.exists(protein_mat_file))
+
+
+## -----------------------------
+## 1. Packages
+## -----------------------------
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(tibble)
+  library(ggplot2)
+  library(ggpubr)
+  library(ggalluvial)
+  library(survival)
+  library(survminer)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+  library(matrixStats)
+  library(uwot)
+  library(scales)
+})
+
+
+## =========================================================
+## 2. Helper functions
+## =========================================================
+
+clean_chr <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_replace_all(x, "\u00A0", " ")
+  x <- stringr::str_replace_all(x, "　", " ")
+  x <- stringr::str_squish(x)
+  x[x %in% c("", "NA", "N/A", "na", "Na", "？", "?", "NULL", "null")] <- NA_character_
+  x
+}
+
+parse_date_any <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  if (inherits(x, "POSIXt")) return(as.Date(x))
+
+  x_chr <- clean_chr(x)
+  x_chr[x_chr %in% c("至今", "？至今", "?至今", "已故 家属不愿意告知")] <- NA_character_
+
+  out <- rep(as.Date(NA), length(x_chr))
+
+  is_excel_num <- grepl("^\\d+(\\.\\d+)?$", x_chr) & !is.na(x_chr)
+  if (any(is_excel_num)) {
+    num <- suppressWarnings(as.numeric(x_chr[is_excel_num]))
+    plausible <- num > 20000 & num < 60000
+    tmp <- rep(as.Date(NA), length(num))
+    tmp[plausible] <- as.Date(num[plausible], origin = "1899-12-30")
+    out[is_excel_num] <- tmp
+  }
+
+  is_char_date <- is.na(out) & !is.na(x_chr)
+  if (any(is_char_date)) {
+    x2 <- x_chr[is_char_date]
+    x2 <- stringr::str_replace_all(x2, "\\?", "")
+    x2 <- stringr::str_replace_all(x2, "？", "")
+    x2 <- stringr::str_replace_all(x2, "\\.", "/")
+    x2 <- stringr::str_replace_all(x2, "-", "/")
+    x2 <- stringr::str_squish(x2)
+
+    parsed <- suppressWarnings(as.Date(x2, format = "%Y/%m/%d"))
+
+    fail <- is.na(parsed)
+    if (any(fail)) {
+      parsed[fail] <- suppressWarnings(as.Date(x2[fail], format = "%Y/%m"))
+    }
+
+    fail <- is.na(parsed)
+    if (any(fail)) {
+      parsed[fail] <- suppressWarnings(as.Date(x2[fail], format = "%m/%d/%Y"))
+    }
+
+    out[is_char_date] <- parsed
+  }
+
+  out
+}
+
+parse_num_any <- function(x) {
+  x_chr <- clean_chr(x)
+  x_chr <- stringr::str_replace_all(x_chr, "？", "")
+  x_chr <- stringr::str_replace_all(x_chr, "\\?", "")
+  x_chr <- stringr::str_replace_all(x_chr, "天|月", "")
+  x_chr <- stringr::str_extract(x_chr, "\\d+\\.?\\d*")
+  suppressWarnings(as.numeric(x_chr))
+}
+
+first_non_na <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA)
+  x[[1]]
+}
+
+min_date_or_na <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(as.Date(NA))
+  min(x)
+}
+
+max_num_or_na <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_real_)
+  max(x)
+}
+
+collapse_unique <- function(x, sep = "; ") {
+  x <- unique(x[!is.na(x) & x != ""])
+  if (length(x) == 0) return(NA_character_)
+  paste(x, collapse = sep)
+}
+
+find_col <- function(df, candidates) {
+  cn <- colnames(df)
+  hit <- cn[cn %in% candidates]
+  if (length(hit) > 0) return(hit[[1]])
+
+  hit2 <- cn[stringr::str_detect(cn, paste(candidates, collapse = "|"))]
+  if (length(hit2) > 0) return(hit2[[1]])
+
+  NA_character_
+}
+
+get_col_or_na <- function(df, col) {
+  if (is.na(col) || !col %in% colnames(df)) {
+    rep(NA, nrow(df))
+  } else {
+    df[[col]]
+  }
+}
+
+normalize_idh <- function(x) {
+  x <- clean_chr(x)
+  dplyr::case_when(
+    is.na(x) ~ NA_character_,
+    stringr::str_detect(x, regex("^normal$|正常|non[- ]?glioma", ignore_case = TRUE)) ~ "Normal",
+    stringr::str_detect(x, regex("野生|wild|WT|Wt|wt", ignore_case = TRUE)) ~ "IDH-wild-type",
+    stringr::str_detect(x, regex("突变|mut|Mut|MUT", ignore_case = TRUE)) ~ "IDH-mutant",
+    TRUE ~ x
+  )
+}
+
+normalize_idh_short <- function(x) {
+  x <- normalize_idh(x)
+  dplyr::case_when(
+    x == "IDH-mutant" ~ "IDH-mut",
+    x == "IDH-wild-type" ~ "IDH-wt",
+    TRUE ~ "Unknown"
+  )
+}
+
+normalize_sex <- function(x) {
+  x <- clean_chr(x)
+  dplyr::case_when(
+    is.na(x) ~ NA_character_,
+    x %in% c("F", "女", "Female", "female") ~ "Female",
+    x %in% c("M", "男", "Male", "male") ~ "Male",
+    TRUE ~ x
+  )
+}
+
+normalize_grade <- function(x) {
+  x <- clean_chr(x)
+  dplyr::case_when(
+    is.na(x) ~ NA_character_,
+    stringr::str_detect(x, "4") ~ "Grade 4",
+    stringr::str_detect(x, "3") ~ "Grade 3",
+    stringr::str_detect(x, "2") ~ "Grade 2",
+    stringr::str_detect(x, "1") ~ "Grade 1",
+    TRUE ~ NA_character_
+  )
+}
+
+detect_yes <- function(x) {
+  x <- clean_chr(x)
+  dplyr::case_when(
+    is.na(x) ~ FALSE,
+    stringr::str_detect(x, "未|无|否|没有") ~ FALSE,
+    stringr::str_detect(
+      x,
+      "放疗|化疗|替莫|替莫唑胺|甲氨蝶呤|福莫司汀|长春新碱|γ刀|r刀|靶向|阿帕替尼|安罗替尼|信迪利|贝伐|免疫"
+    ) ~ TRUE,
+    TRUE ~ FALSE
+  )
+}
+
+detect_tmz <- function(x) {
+  x <- clean_chr(x)
+  dplyr::case_when(
+    is.na(x) ~ FALSE,
+    stringr::str_detect(x, "未|无|否|没有") ~ FALSE,
+    stringr::str_detect(x, "替莫|替莫唑胺|TMZ|tmz") ~ TRUE,
+    TRUE ~ FALSE
+  )
+}
+
+detect_other_chemo <- function(x) {
+  x <- clean_chr(x)
+  dplyr::case_when(
+    is.na(x) ~ FALSE,
+    stringr::str_detect(x, "未|无|否|没有") ~ FALSE,
+    stringr::str_detect(x, "甲氨蝶呤|福莫司汀|长春新碱") ~ TRUE,
+    stringr::str_detect(x, "化疗") &
+      !stringr::str_detect(x, "替莫|替莫唑胺|TMZ|tmz") ~ TRUE,
+    TRUE ~ FALSE
+  )
+}
+
+detect_target <- function(x) {
+  x <- clean_chr(x)
+  dplyr::case_when(
+    is.na(x) ~ FALSE,
+    stringr::str_detect(x, "未|无|否|没有") ~ FALSE,
+    stringr::str_detect(x, "靶向|免疫|阿帕替尼|安罗替尼|信迪利|贝伐|PD|PD-1|PD1") ~ TRUE,
+    TRUE ~ FALSE
+  )
+}
+
+get_surgery_index_from_id <- function(sample_id) {
+  sid <- as.character(sample_id)
+  dplyr::case_when(
+    stringr::str_detect(sid, "myy1") ~ 1L,
+    stringr::str_detect(sid, "myy2") ~ 2L,
+    stringr::str_detect(sid, "myy3") ~ 3L,
+    TRUE ~ NA_integer_
+  )
+}
+
+get_timepoint_from_index <- function(idx, force_na = FALSE) {
+  dplyr::case_when(
+    force_na ~ "N/A",
+    is.na(idx) ~ "N/A",
+    idx == 1L ~ "Primary",
+    idx == 2L ~ "Recurrent",
+    idx >= 3L ~ "Second recurrent",
+    TRUE ~ "N/A"
+  )
+}
+
+infer_region_from_sample <- function(sample_id) {
+  dplyr::case_when(
+    stringr::str_detect(sample_id, "^Chnsrmyy") ~ "Tumor core",
+    stringr::str_detect(sample_id, "^Bhnsrmyy") ~ "Tumor edge",
+    stringr::str_detect(sample_id, "^Nhnsrmyy") ~ "Adjacent brain",
+    TRUE ~ "Unknown"
+  )
+}
+
+row_zscore <- function(mat) {
+  mat <- as.matrix(mat)
+  z <- t(scale(t(mat)))
+  z[!is.finite(z)] <- NA
+  z
+}
+
+safe_read_sheet <- function(path, sheet) {
+  readxl::read_excel(path, sheet = sheet, guess_max = 10000)
+}
+
+
+## =========================================================
+## 3. Read and standardize sample-level metadata
+## =========================================================
+
+standardize_region_table <- function(df, region_label) {
+  required_cn <- c("编号", "病理号", "姓名", "性别", "年龄", "分子状态")
+  missing_cn <- setdiff(required_cn, colnames(df))
+
+  if (length(missing_cn) > 0) {
+    stop(
+      "Missing columns in Table1 sheet for ",
+      region_label,
+      ": ",
+      paste(missing_cn, collapse = ", ")
+    )
+  }
+
+  df %>%
+    transmute(
+      sample_id = clean_chr(.data[["编号"]]),
+      pathology_id = clean_chr(.data[["病理号"]]),
+      patient_name = clean_chr(.data[["姓名"]]),
+      sex_raw = clean_chr(.data[["性别"]]),
+      birth_raw = .data[["年龄"]],
+      idh_raw = clean_chr(.data[["分子状态"]]),
+      region_raw = region_label
+    ) %>%
+    filter(!is.na(sample_id)) %>%
+    filter(!stringr::str_detect(sample_id, "无|删除|已删除")) %>%
+    mutate(
+      region = case_when(
+        region_raw == "core" ~ "Tumor core",
+        region_raw == "edge" ~ "Tumor edge",
+        region_raw == "normal" ~ "Adjacent brain",
+        TRUE ~ region_raw
+      ),
+      birth_date_sample = parse_date_any(birth_raw),
+      sex = normalize_sex(sex_raw),
+      idh_status_sample = normalize_idh(idh_raw),
+      surgery_index = get_surgery_index_from_id(sample_id),
+      time_point_from_id = get_timepoint_from_index(surgery_index)
+    )
+}
+
+core_raw   <- safe_read_sheet(table1_file, "core")
+edge_raw   <- safe_read_sheet(table1_file, "edge")
+normal_raw <- safe_read_sheet(table1_file, "normal")
+
+samples_all <- bind_rows(
+  standardize_region_table(core_raw, "core"),
+  standardize_region_table(edge_raw, "edge"),
+  standardize_region_table(normal_raw, "normal")
+)
+
+## Non-glioma normal brain controls.
+## Nhnsrmyy01 is glioma-associated adjacent brain.
+non_glioma_normal_ids <- c(
+  "Nhnsrmyy02", "Nhnsrmyy03", "Nhnsrmyy04", "Nhnsrmyy05", "Nhnsrmyy06",
+  "Nhnsrmyy07", "Nhnsrmyy08", "Nhnsrmyy09", "Nhnsrmyy010", "Nhnsrmyy011"
+)
+
+samples_all <- samples_all %>%
+  mutate(
+    tissue_source = case_when(
+      sample_id %in% non_glioma_normal_ids ~ "Non-glioma normal brain",
+      region == "Adjacent brain" ~ "Glioma-associated adjacent brain",
+      region %in% c("Tumor core", "Tumor edge") ~ "Glioma tissue",
+      TRUE ~ "Unknown"
+    ),
+    region = case_when(
+      tissue_source == "Non-glioma normal brain" ~ "Non-glioma normal brain",
+      tissue_source == "Glioma-associated adjacent brain" ~ "Adjacent brain",
+      TRUE ~ as.character(region)
+    )
+  )
+
+
+## =========================================================
+## 4. Read and standardize clinical metadata
+## =========================================================
+
+clin_raw <- safe_read_sheet(table2_file, "clinical")
+colnames(clin_raw) <- clean_chr(colnames(clin_raw))
+
+col_sample_id <- find_col(clin_raw, c("编号"))
+col_pathology <- find_col(clin_raw, c("病理号"))
+col_name      <- find_col(clin_raw, c("姓名"))
+col_sex       <- find_col(clin_raw, c("性别"))
+col_birth     <- find_col(clin_raw, c("年龄"))
+col_idh       <- find_col(clin_raw, c("分子状态"))
+col_grade     <- find_col(clin_raw, c("WHO级别", "WHO", "级别"))
+col_disease   <- find_col(clin_raw, c("疾病时间"))
+col_prog      <- find_col(clin_raw, c("进展时间天", "进展时间（天）", "进展时间"))
+col_surv_date <- find_col(clin_raw, c("生存日期"))
+col_surv      <- find_col(clin_raw, c("生存时间"))
+col_radio     <- find_col(clin_raw, c("放疗"))
+col_chemo     <- find_col(clin_raw, c("化疗"))
+col_target    <- find_col(clin_raw, c("靶向免疫", "靶向", "免疫"))
+
+required_clin <- c(col_sample_id, col_name, col_birth, col_idh, col_grade, col_disease)
+if (any(is.na(required_clin))) {
+  stop(
+    "Cannot identify required clinical columns. Detected columns are:\n",
+    paste(colnames(clin_raw), collapse = ", ")
+  )
+}
+
+clin <- clin_raw %>%
+  transmute(
+    sample_id_clin = clean_chr(.data[[col_sample_id]]),
+    pathology_id_clin = clean_chr(get_col_or_na(clin_raw, col_pathology)),
+    patient_name_clin = clean_chr(.data[[col_name]]),
+    sex_raw_clin = clean_chr(get_col_or_na(clin_raw, col_sex)),
+    birth_raw_clin = .data[[col_birth]],
+    idh_raw_clin = clean_chr(.data[[col_idh]]),
+    who_grade_raw = clean_chr(.data[[col_grade]]),
+    disease_date_raw = .data[[col_disease]],
+    progression_days_raw = get_col_or_na(clin_raw, col_prog),
+    survival_date_raw = get_col_or_na(clin_raw, col_surv_date),
+    survival_days_raw = get_col_or_na(clin_raw, col_surv),
+    radiotherapy_raw = clean_chr(get_col_or_na(clin_raw, col_radio)),
+    chemo_raw = clean_chr(get_col_or_na(clin_raw, col_chemo)),
+    targeted_immuno_raw = clean_chr(get_col_or_na(clin_raw, col_target))
+  ) %>%
+  filter(!is.na(sample_id_clin)) %>%
+  mutate(
+    sex_clin = normalize_sex(sex_raw_clin),
+    idh_status_clin = normalize_idh(idh_raw_clin),
+    who_grade_plot = normalize_grade(who_grade_raw),
+    disease_date = parse_date_any(disease_date_raw),
+    birth_date_clin = parse_date_any(birth_raw_clin),
+    progression_days = parse_num_any(progression_days_raw),
+    survival_days = parse_num_any(survival_days_raw),
+    surgery_index_clin = get_surgery_index_from_id(sample_id_clin),
+    time_point_clin = get_timepoint_from_index(surgery_index_clin),
+    radio_after_sampling = detect_yes(radiotherapy_raw),
+    tmz_after_sampling = detect_tmz(chemo_raw),
+    other_chemo_after_sampling = detect_other_chemo(chemo_raw),
+    target_after_sampling = detect_target(targeted_immuno_raw)
+  )
+
+## Prior treatment before each sample acquisition.
+clin_prior <- clin %>%
+  arrange(patient_name_clin, disease_date, surgery_index_clin) %>%
+  group_by(patient_name_clin) %>%
+  mutate(
+    prior_radiotherapy = lag(cumsum(replace_na(radio_after_sampling, FALSE)) > 0, default = FALSE),
+    prior_tmz_chemo = lag(cumsum(replace_na(tmz_after_sampling, FALSE)) > 0, default = FALSE),
+    prior_other_chemo = lag(cumsum(replace_na(other_chemo_after_sampling, FALSE)) > 0, default = FALSE),
+    prior_targeted_immuno = lag(cumsum(replace_na(target_after_sampling, FALSE)) > 0, default = FALSE)
+  ) %>%
+  ungroup()
+
+patient_level <- clin_prior %>%
+  group_by(patient_name_clin) %>%
+  summarise(
+    first_disease_date = min_date_or_na(disease_date),
+    birth_date_patient = first_non_na(birth_date_clin),
+    sex_patient = first_non_na(sex_clin),
+    idh_status_patient = first_non_na(idh_status_clin),
+    age_at_diagnosis_patient = if_else(
+      is.na(first_disease_date) | is.na(birth_date_patient),
+      NA_real_,
+      as.numeric(first_disease_date - birth_date_patient) / 365.25
+    ),
+    ttp_months = max_num_or_na(progression_days) / 30.44,
+    os_months = max_num_or_na(survival_days) / 30.44,
+    ttp_days = max_num_or_na(progression_days),
+    os_days = max_num_or_na(survival_days),
+    .groups = "drop"
+  )
+
+clin_for_join <- clin_prior %>%
+  select(
+    sample_id_clin,
+    patient_name_clin,
+    surgery_index_clin,
+    disease_date,
+    birth_date_clin,
+    idh_status_clin,
+    who_grade_plot,
+    time_point_clin,
+    prior_radiotherapy,
+    prior_tmz_chemo,
+    prior_other_chemo,
+    prior_targeted_immuno
+  )
+
+
+## =========================================================
+## 5. Merge sample-level and patient-level annotation
+## =========================================================
+
+fig1_anno <- samples_all %>%
+  left_join(clin_for_join, by = c("sample_id" = "sample_id_clin")) %>%
+  left_join(patient_level, by = c("patient_name" = "patient_name_clin"))
+
+## Backup join by patient + surgery index.
+backup_join <- samples_all %>%
+  select(sample_id, patient_name, surgery_index) %>%
+  left_join(
+    clin_for_join,
+    by = c(
+      "patient_name" = "patient_name_clin",
+      "surgery_index" = "surgery_index_clin"
+    )
+  ) %>%
+  select(
+    sample_id,
+    disease_date_backup = disease_date,
+    birth_date_clin_backup = birth_date_clin,
+    idh_status_clin_backup = idh_status_clin,
+    who_grade_plot_backup = who_grade_plot,
+    time_point_clin_backup = time_point_clin,
+    prior_radiotherapy_backup = prior_radiotherapy,
+    prior_tmz_chemo_backup = prior_tmz_chemo,
+    prior_other_chemo_backup = prior_other_chemo,
+    prior_targeted_immuno_backup = prior_targeted_immuno
+  )
+
+fig1_anno <- fig1_anno %>%
+  left_join(backup_join, by = "sample_id") %>%
+  mutate(
+    disease_date = coalesce(disease_date, disease_date_backup),
+    birth_date_clin = coalesce(birth_date_clin, birth_date_clin_backup),
+    idh_status_clin = coalesce(idh_status_clin, idh_status_clin_backup),
+    who_grade_plot = coalesce(who_grade_plot, who_grade_plot_backup),
+    time_point_clin = coalesce(time_point_clin, time_point_clin_backup),
+    prior_radiotherapy = coalesce(prior_radiotherapy, prior_radiotherapy_backup),
+    prior_tmz_chemo = coalesce(prior_tmz_chemo, prior_tmz_chemo_backup),
+    prior_other_chemo = coalesce(prior_other_chemo, prior_other_chemo_backup),
+    prior_targeted_immuno = coalesce(prior_targeted_immuno, prior_targeted_immuno_backup)
+  ) %>%
+  select(-ends_with("_backup"))
+
+## Final plotting variables.
+fig1_anno <- fig1_anno %>%
+  mutate(
+    age_from_sample_birth = if_else(
+      !is.na(disease_date) & !is.na(birth_date_sample),
+      as.numeric(disease_date - birth_date_sample) / 365.25,
+      NA_real_
+    ),
+
+    pathology_year2 = suppressWarnings(as.integer(str_extract(pathology_id, "^\\d{2}"))),
+    pathology_year = if_else(is.na(pathology_year2), NA_integer_, 2000L + pathology_year2),
+    age_normal_control = if_else(
+      tissue_source == "Non-glioma normal brain" &
+        !is.na(pathology_year) &
+        !is.na(birth_date_sample),
+      pathology_year - as.integer(format(birth_date_sample, "%Y")),
+      NA_real_
+    ),
+
+    idh_status_final = coalesce(idh_status_clin, idh_status_patient, idh_status_sample),
+
+    block = case_when(
+      tissue_source == "Non-glioma normal brain" ~ "Normal brain",
+      tissue_source == "Glioma-associated adjacent brain" ~ "Adjacent brain",
+      idh_status_final == "IDH-mutant" ~ "IDH-mutant glioma",
+      idh_status_final == "IDH-wild-type" ~ "IDH-wild-type glioma",
+      TRUE ~ "Other"
+    ),
+
+    age_years = case_when(
+      block == "Normal brain" ~ age_normal_control,
+      TRUE ~ coalesce(age_at_diagnosis_patient, age_from_sample_birth)
+    ),
+
+    glioma_idh_context = case_when(
+      block == "Normal brain" ~ "N/A",
+      idh_status_final == "IDH-mutant" ~ "IDH-mutant glioma context",
+      idh_status_final == "IDH-wild-type" ~ "IDH-wild-type glioma context",
+      TRUE ~ "N/A"
+    ),
+
+    time_point = case_when(
+      block == "Normal brain" ~ "N/A",
+      TRUE ~ get_timepoint_from_index(surgery_index, force_na = FALSE)
+    ),
+
+    who_grade_plot = case_when(
+      block %in% c("Normal brain", "Adjacent brain") ~ "N/A",
+      is.na(who_grade_plot) ~ "N/A",
+      TRUE ~ who_grade_plot
+    ),
+
+    sex_plot = if_else(is.na(sex), "N/A", sex),
+
+    prior_radiotherapy_plot = case_when(
+      block == "Normal brain" ~ "N/A",
+      prior_radiotherapy %in% TRUE ~ "Yes",
+      TRUE ~ "No"
+    ),
+    prior_tmz_chemo_plot = case_when(
+      block == "Normal brain" ~ "N/A",
+      prior_tmz_chemo %in% TRUE ~ "Yes",
+      TRUE ~ "No"
+    ),
+    prior_other_chemo_plot = case_when(
+      block == "Normal brain" ~ "N/A",
+      prior_other_chemo %in% TRUE ~ "Yes",
+      TRUE ~ "No"
+    ),
+    prior_targeted_immuno_plot = case_when(
+      block == "Normal brain" ~ "N/A",
+      prior_targeted_immuno %in% TRUE ~ "Yes",
+      TRUE ~ "No"
+    ),
+
+    ttp_months = if_else(block == "Normal brain", NA_real_, ttp_months),
+    os_months = if_else(block == "Normal brain", NA_real_, os_months)
+  )
+
+block_levels  <- c("Normal brain", "Adjacent brain", "IDH-mutant glioma", "IDH-wild-type glioma")
+region_levels <- c("Non-glioma normal brain", "Adjacent brain", "Tumor core", "Tumor edge")
+time_levels   <- c("N/A", "Primary", "Recurrent", "Second recurrent")
+sex_levels    <- c("N/A", "Female", "Male")
+idh_context_levels <- c("N/A", "IDH-mutant glioma context", "IDH-wild-type glioma context")
+grade_levels  <- c("N/A", "Grade 1", "Grade 2", "Grade 3", "Grade 4")
+yesno_levels  <- c("N/A", "No", "Yes")
+
+fig1_anno <- fig1_anno %>%
+  filter(block %in% block_levels) %>%
+  mutate(
+    block = factor(block, levels = block_levels),
+    region = factor(region, levels = region_levels),
+    time_point = factor(time_point, levels = time_levels),
+    sex_plot = factor(sex_plot, levels = sex_levels),
+    glioma_idh_context = factor(glioma_idh_context, levels = idh_context_levels),
+    who_grade_plot = factor(who_grade_plot, levels = grade_levels),
+    prior_radiotherapy_plot = factor(prior_radiotherapy_plot, levels = yesno_levels),
+    prior_tmz_chemo_plot = factor(prior_tmz_chemo_plot, levels = yesno_levels),
+    prior_other_chemo_plot = factor(prior_other_chemo_plot, levels = yesno_levels),
+    prior_targeted_immuno_plot = factor(prior_targeted_immuno_plot, levels = yesno_levels),
+    order_time = case_when(
+      time_point == "N/A" ~ 0,
+      time_point == "Primary" ~ 1,
+      time_point == "Recurrent" ~ 2,
+      time_point == "Second recurrent" ~ 3,
+      TRUE ~ 9
+    ),
+    order_region = case_when(
+      region == "Non-glioma normal brain" ~ 0,
+      region == "Adjacent brain" ~ 1,
+      region == "Tumor core" ~ 2,
+      region == "Tumor edge" ~ 3,
+      TRUE ~ 9
+    )
+  ) %>%
+  arrange(block, patient_name, order_time, order_region, sample_id)
+
+write.csv(
+  fig1_anno,
+  file = file.path(out_tbl_dir, "Fig1_sample_annotation_master.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+
+## =========================================================
+## 6. Figure 1B: sample-level annotation heatmap
+## =========================================================
+
+anno_df <- data.frame(
+  Region = as.character(fig1_anno$region),
+  `Time point` = as.character(fig1_anno$time_point),
+  Sex = as.character(fig1_anno$sex_plot),
+  `Glioma IDH context` = as.character(fig1_anno$glioma_idh_context),
+  `WHO grade` = as.character(fig1_anno$who_grade_plot),
+  `Prior radiotherapy` = as.character(fig1_anno$prior_radiotherapy_plot),
+  `Prior TMZ chemo` = as.character(fig1_anno$prior_tmz_chemo_plot),
+  `Prior other chemo` = as.character(fig1_anno$prior_other_chemo_plot),
+  `Prior targeted/immuno` = as.character(fig1_anno$prior_targeted_immuno_plot),
+  check.names = FALSE
+)
+
+rownames(anno_df) <- fig1_anno$sample_id
+anno_mat <- as.matrix(t(anno_df))
+
+col_list <- list(
+  Region = c(
+    "Non-glioma normal brain" = "#8BD646",
+    "Adjacent brain" = "#5FA846",
+    "Tumor core" = "#C74E92",
+    "Tumor edge" = "#E68632"
+  ),
+  `Time point` = c(
+    "N/A" = "#D9D9D9",
+    "Primary" = "#1F6B35",
+    "Recurrent" = "#B9272E",
+    "Second recurrent" = "#7F1D1D"
+  ),
+  Sex = c(
+    "N/A" = "#D9D9D9",
+    "Female" = "#CC4F96",
+    "Male" = "#77A6D8"
+  ),
+  `Glioma IDH context` = c(
+    "N/A" = "#D9D9D9",
+    "IDH-mutant glioma context" = "#D9A2C8",
+    "IDH-wild-type glioma context" = "#9CC7DF"
+  ),
+  `WHO grade` = c(
+    "N/A" = "#D9D9D9",
+    "Grade 1" = "#9E2F27",
+    "Grade 2" = "#B52B86",
+    "Grade 3" = "#B59930",
+    "Grade 4" = "#7F1D1D"
+  ),
+  `Prior radiotherapy` = c("N/A" = "#D9D9D9", "No" = "#E8EAED", "Yes" = "#E39B32"),
+  `Prior TMZ chemo` = c("N/A" = "#D9D9D9", "No" = "#92B47E", "Yes" = "#111111"),
+  `Prior other chemo` = c("N/A" = "#D9D9D9", "No" = "#9A6AA5", "Yes" = "#E29A42"),
+  `Prior targeted/immuno` = c("N/A" = "#D9D9D9", "No" = "#F3F6C8", "Yes" = "#143B23")
+)
+
+color_mat <- matrix(
+  "#FFFFFF",
+  nrow = nrow(anno_mat),
+  ncol = ncol(anno_mat),
+  dimnames = dimnames(anno_mat)
+)
+
+for (rn in rownames(anno_mat)) {
+  vals <- anno_mat[rn, ]
+  pal <- col_list[[rn]]
+  color_mat[rn, ] <- pal[vals]
+  color_mat[rn, is.na(color_mat[rn, ])] <- "#FFFFFF"
+}
+
+age_vec <- fig1_anno$age_years
+ttp_vec <- fig1_anno$ttp_months
+os_vec  <- fig1_anno$os_months
+
+age_vec[is.na(age_vec)] <- 0
+ttp_vec[is.na(ttp_vec)] <- 0
+os_vec[is.na(os_vec)] <- 0
+
+age_ylim <- c(0, max(90, ceiling(max(age_vec, na.rm = TRUE) / 10) * 10))
+ttp_ylim <- c(0, max(100, ceiling(max(ttp_vec, na.rm = TRUE) / 10) * 10))
+os_ylim  <- c(0, max(100, ceiling(max(os_vec, na.rm = TRUE) / 10) * 10))
+
+column_split <- droplevels(factor(as.character(fig1_anno$block), levels = block_levels))
+
+ht_main <- Heatmap(
+  color_mat,
+  name = "Annotation",
+  col = circlize::colorRamp2(c(0, 1), c("white", "white")),
+  rect_gp = gpar(col = "white", lwd = 0.35),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 8),
+  row_names_max_width = unit(3.8, "cm"),
+  show_column_names = FALSE,
+  column_split = column_split,
+  column_title = levels(column_split),
+  column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+  column_gap = unit(3, "mm"),
+  show_heatmap_legend = FALSE,
+  width = unit(23.5, "cm"),
+  height = unit(2.5, "cm"),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.rect(
+      x, y, width, height,
+      gp = gpar(fill = color_mat[i, j], col = "white", lwd = 0.25)
+    )
+  }
+)
+
+ha_age <- HeatmapAnnotation(
+  `Age\n(years)` = anno_barplot(
+    age_vec,
+    gp = gpar(fill = "#9AA3AF", col = NA),
+    border = FALSE,
+    ylim = age_ylim,
+    axis = TRUE,
+    axis_param = list(side = "right", at = c(0, 40, 80), labels = c("0", "40", "80")),
+    height = unit(0.95, "cm")
+  ),
+  annotation_name_side = "left",
+  annotation_name_gp = gpar(fontsize = 8)
+)
+
+ha_ttp <- HeatmapAnnotation(
+  `TTP\n(months)` = anno_barplot(
+    ttp_vec,
+    gp = gpar(fill = "#D94B42", col = NA),
+    border = FALSE,
+    ylim = ttp_ylim,
+    axis = TRUE,
+    axis_param = list(side = "right", at = pretty(ttp_ylim, n = 3)),
+    height = unit(0.95, "cm")
+  ),
+  annotation_name_side = "left",
+  annotation_name_gp = gpar(fontsize = 8)
+)
+
+ha_os <- HeatmapAnnotation(
+  `OS\n(months)` = anno_barplot(
+    os_vec,
+    gp = gpar(fill = "#111827", col = NA),
+    border = FALSE,
+    ylim = os_ylim,
+    axis = TRUE,
+    axis_param = list(side = "right", at = pretty(os_ylim, n = 3)),
+    height = unit(0.95, "cm")
+  ),
+  annotation_name_side = "left",
+  annotation_name_gp = gpar(fontsize = 8)
+)
+
+make_lgd <- function(title, values) {
+  Legend(
+    title = title,
+    labels = names(values),
+    legend_gp = gpar(fill = unname(values)),
+    title_gp = gpar(fontface = "bold", fontsize = 9),
+    labels_gp = gpar(fontsize = 8),
+    ncol = 1
+  )
+}
+
+legend_pack <- packLegend(
+  make_lgd("Region", col_list$Region),
+  make_lgd("Time point", col_list$`Time point`),
+  make_lgd("Sex", col_list$Sex),
+  make_lgd("Glioma IDH context", col_list$`Glioma IDH context`),
+  make_lgd("WHO grade", col_list$`WHO grade`),
+  make_lgd("Prior radiotherapy", col_list$`Prior radiotherapy`),
+  make_lgd("Prior TMZ chemo", col_list$`Prior TMZ chemo`),
+  make_lgd("Prior other chemo", col_list$`Prior other chemo`),
+  make_lgd("Prior targeted/immuno", col_list$`Prior targeted/immuno`),
+  direction = "horizontal",
+  gap = unit(5, "mm")
+)
+
+ht_fig1b <- ht_main %v% ha_age %v% ha_ttp %v% ha_os
+
+pdf(file.path(out_fig_dir, "Fig1B_clinicopathological_annotation.pdf"),
+    width = 16, height = 7.2, useDingbats = FALSE)
+draw(
+  ht_fig1b,
+  heatmap_legend_list = list(legend_pack),
+  heatmap_legend_side = "bottom",
+  padding = unit(c(8, 4, 8, 4), "mm")
+)
+dev.off()
+
+png(file.path(out_fig_dir, "Fig1B_clinicopathological_annotation.png"),
+    width = 5200, height = 2350, res = 300)
+draw(
+  ht_fig1b,
+  heatmap_legend_list = list(legend_pack),
+  heatmap_legend_side = "bottom",
+  padding = unit(c(8, 4, 8, 4), "mm")
+)
+dev.off()
+
+
+## =========================================================
+## 7. Patient-level table for Fig1C, Fig1D-E and FigS1
+## =========================================================
+
+patient_tbl <- fig1_anno %>%
+  filter(block %in% c("IDH-mutant glioma", "IDH-wild-type glioma", "Adjacent brain")) %>%
+  filter(tissue_source != "Non-glioma normal brain") %>%
+  group_by(patient_name) %>%
+  summarise(
+    patient_id = first_non_na(patient_name),
+    sex = first_non_na(as.character(sex_plot)),
+    idh_status = first_non_na(idh_status_final),
+    age_at_diagnosis = first_non_na(age_years),
+    os_days = first_non_na(os_days),
+    ttp_days = first_non_na(ttp_days),
+    os_months = first_non_na(os_months),
+    ttp_months = first_non_na(ttp_months),
+    primary_grade = first_non_na(as.character(who_grade_plot[time_point == "Primary" & who_grade_plot != "N/A"])),
+    recurrent_grade = first_non_na(as.character(who_grade_plot[time_point %in% c("Recurrent", "Second recurrent") & who_grade_plot != "N/A"])),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    idh_status_short = normalize_idh_short(idh_status),
+    primary_grade = if_else(is.na(primary_grade), "N/A", primary_grade),
+    recurrent_grade = if_else(is.na(recurrent_grade), "N/A", recurrent_grade),
+    os_event = if_else(!is.na(os_days), 1, 0),
+    pfs_event = if_else(!is.na(ttp_days), 1, 0)
+  ) %>%
+  filter(idh_status_short %in% c("IDH-mut", "IDH-wt"))
+
+write.csv(
+  patient_tbl,
+  file = file.path(out_tbl_dir, "Fig1_patient_level_metadata.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+
+## =========================================================
+## 8. Figure 1C: patient-level distributions
+## =========================================================
+
+plot_patient_distribution <- function(df, var, title, xlab = NULL) {
+  var <- rlang::ensym(var)
+
+  dd <- df %>%
+    filter(!is.na(!!var), !!var != "N/A") %>%
+    count(!!var, name = "n") %>%
+    mutate(
+      pct = n / sum(n),
+      label = paste0(n, "\n", scales::percent(pct, accuracy = 1))
+    )
+
+  ggplot(dd, aes(x = !!var, y = n)) +
+    geom_col(width = 0.65, fill = "#6B7280") +
+    geom_text(aes(label = label), vjust = -0.25, size = 3.5) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+    labs(title = title, x = xlab, y = "Patients") +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.text.x = element_text(angle = 25, hjust = 1),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6)
+    )
+}
+
+p_grade_primary <- plot_patient_distribution(patient_tbl, primary_grade, "Primary WHO grade")
+p_grade_recur   <- plot_patient_distribution(patient_tbl, recurrent_grade, "Recurrent WHO grade")
+p_idh           <- plot_patient_distribution(patient_tbl, idh_status_short, "IDH status")
+p_age <- ggplot(patient_tbl, aes(x = age_at_diagnosis)) +
+  geom_histogram(binwidth = 10, fill = "#9AA3AF", color = "white") +
+  labs(title = "Age at diagnosis", x = "Age, years", y = "Patients") +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6)
+  )
+
+fig1c <- ggpubr::ggarrange(
+  p_grade_primary, p_grade_recur, p_idh, p_age,
+  nrow = 1,
+  ncol = 4,
+  align = "h"
+)
+
+ggsave(
+  file.path(out_fig_dir, "Fig1C_patient_level_distributions.pdf"),
+  fig1c,
+  width = 12,
+  height = 3.2
+)
+
+
+## =========================================================
+## 9. Figure 1D-E: Kaplan-Meier curves by IDH status
+## =========================================================
+
+km_theme <- theme_classic(base_size = 12)
+
+surv_os <- survival::Surv(time = patient_tbl$os_days, event = patient_tbl$os_event)
+fit_os <- survival::survfit(surv_os ~ idh_status_short, data = patient_tbl)
+
+p_os <- survminer::ggsurvplot(
+  fit_os,
+  data = patient_tbl,
+  pval = TRUE,
+  risk.table = TRUE,
+  censor = TRUE,
+  palette = c("IDH-mut" = "#2F77B4", "IDH-wt" = "#9467BD"),
+  xlab = "Overall survival time (days)",
+  ylab = "Overall survival probability",
+  legend.title = "IDH status",
+  legend.labs = c("IDH-mut", "IDH-wt"),
+  ggtheme = km_theme
+)
+
+pdf(file.path(out_fig_dir, "Fig1D_OS_by_IDH_KM.pdf"), width = 5.5, height = 5.8)
+print(p_os)
+dev.off()
+
+surv_pfs <- survival::Surv(time = patient_tbl$ttp_days, event = patient_tbl$pfs_event)
+fit_pfs <- survival::survfit(surv_pfs ~ idh_status_short, data = patient_tbl)
+
+p_pfs <- survminer::ggsurvplot(
+  fit_pfs,
+  data = patient_tbl,
+  pval = TRUE,
+  risk.table = TRUE,
+  censor = TRUE,
+  palette = c("IDH-mut" = "#2F77B4", "IDH-wt" = "#9467BD"),
+  xlab = "Progression-free survival time (days)",
+  ylab = "Progression-free survival probability",
+  legend.title = "IDH status",
+  legend.labs = c("IDH-mut", "IDH-wt"),
+  ggtheme = km_theme
+)
+
+pdf(file.path(out_fig_dir, "Fig1E_PFS_by_IDH_KM.pdf"), width = 5.5, height = 5.8)
+print(p_pfs)
+dev.off()
+
+
+## =========================================================
+## 10. Figure S1A: patient-level sampling map
+## =========================================================
+
+collapse_grade_transition <- function(grade_vec, time_vec) {
+  df <- data.frame(
+    grade = as.character(grade_vec),
+    time = as.character(time_vec),
+    stringsAsFactors = FALSE
+  ) %>%
+    filter(!is.na(grade), grade != "N/A", !is.na(time), time != "N/A") %>%
+    mutate(
+      time_order = case_when(
+        time == "Primary" ~ 1,
+        time == "Recurrent" ~ 2,
+        time == "Second recurrent" ~ 3,
+        TRUE ~ 9
+      )
+    ) %>%
+    arrange(time_order)
+
+  if (nrow(df) == 0) return("N/A")
+  paste(unique(df$grade), collapse = " -> ")
+}
+
+glioma_samples <- fig1_anno %>%
+  filter(tissue_source != "Non-glioma normal brain") %>%
+  filter(!is.na(patient_name)) %>%
+  mutate(
+    time_region = case_when(
+      time_point == "Primary" & region == "Tumor core" ~ "Primary_TC",
+      time_point == "Primary" & region == "Tumor edge" ~ "Primary_TE",
+      time_point == "Primary" & region == "Adjacent brain" ~ "Primary_AB",
+      time_point == "Recurrent" & region == "Tumor core" ~ "Recurrent_TC",
+      time_point == "Recurrent" & region == "Tumor edge" ~ "Recurrent_TE",
+      time_point == "Recurrent" & region == "Adjacent brain" ~ "Recurrent_AB",
+      time_point == "Second recurrent" & region == "Tumor core" ~ "SecondRec_TC",
+      time_point == "Second recurrent" & region == "Tumor edge" ~ "SecondRec_TE",
+      time_point == "Second recurrent" & region == "Adjacent brain" ~ "SecondRec_AB",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(time_region))
+
+time_region_levels <- c(
+  "Primary_TC", "Primary_TE", "Primary_AB",
+  "Recurrent_TC", "Recurrent_TE", "Recurrent_AB",
+  "SecondRec_TC", "SecondRec_TE", "SecondRec_AB"
+)
+
+cell_tbl <- glioma_samples %>%
+  group_by(patient_name, time_region) %>%
+  summarise(
+    sample_ids = collapse_unique(sample_id, sep = "\n"),
+    n_samples = n(),
+    .groups = "drop"
+  )
+
+patient_meta <- glioma_samples %>%
+  group_by(patient_name) %>%
+  summarise(
+    idh_status = first_non_na(idh_status_final),
+    sex = first_non_na(as.character(sex_plot)),
+    age_at_diagnosis = first_non_na(age_years),
+    ttp_months = first_non_na(ttp_months),
+    os_months = first_non_na(os_months),
+    grade_transition = collapse_grade_transition(who_grade_plot, time_point),
+    n_total_samples = n(),
+    n_tc = sum(region == "Tumor core", na.rm = TRUE),
+    n_te = sum(region == "Tumor edge", na.rm = TRUE),
+    n_ab = sum(region == "Adjacent brain", na.rm = TRUE),
+    has_primary_tc = any(time_region == "Primary_TC"),
+    has_primary_te = any(time_region == "Primary_TE"),
+    has_recurrent_tc = any(time_region == "Recurrent_TC"),
+    has_recurrent_te = any(time_region == "Recurrent_TE"),
+    has_paired_tc = has_primary_tc & has_recurrent_tc,
+    has_paired_te = has_primary_te & has_recurrent_te,
+    has_primary_tc_te = has_primary_tc & has_primary_te,
+    has_recurrent_tc_te = has_recurrent_tc & has_recurrent_te,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    idh_status = if_else(is.na(idh_status), "Unknown", idh_status),
+    sex = if_else(is.na(sex), "N/A", sex),
+    grade_transition = if_else(is.na(grade_transition), "N/A", grade_transition)
+  )
+
+patient_order <- patient_meta %>%
+  mutate(
+    idh_order = case_when(
+      idh_status == "IDH-mutant" ~ 1,
+      idh_status == "IDH-wild-type" ~ 2,
+      TRUE ~ 9
+    ),
+    paired_strength = case_when(
+      has_paired_tc & has_paired_te ~ 1,
+      has_paired_te ~ 2,
+      has_paired_tc ~ 3,
+      TRUE ~ 4
+    )
+  ) %>%
+  arrange(idh_order, paired_strength, grade_transition, patient_name) %>%
+  pull(patient_name)
+
+sample_id_mat <- matrix(
+  "",
+  nrow = length(patient_order),
+  ncol = length(time_region_levels),
+  dimnames = list(patient_order, time_region_levels)
+)
+
+status_mat <- matrix(
+  "No sample",
+  nrow = length(patient_order),
+  ncol = length(time_region_levels),
+  dimnames = list(patient_order, time_region_levels)
+)
+
+for (i in seq_len(nrow(cell_tbl))) {
+  p <- cell_tbl$patient_name[i]
+  tr <- cell_tbl$time_region[i]
+
+  if (p %in% rownames(sample_id_mat) && tr %in% colnames(sample_id_mat)) {
+    sample_id_mat[p, tr] <- cell_tbl$sample_ids[i]
+    status_mat[p, tr] <- case_when(
+      str_detect(tr, "_TC$") ~ "Tumor core",
+      str_detect(tr, "_TE$") ~ "Tumor edge",
+      str_detect(tr, "_AB$") ~ "Adjacent brain",
+      TRUE ~ "Sample"
+    )
+  }
+}
+
+write.csv(
+  as.data.frame(sample_id_mat) %>% rownames_to_column("patient_name"),
+  file = file.path(out_tbl_dir, "FigS1A_patient_sampling_map.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+status_col <- c(
+  "No sample" = "#F2F2F2",
+  "Tumor core" = "#C74E92",
+  "Tumor edge" = "#E68632",
+  "Adjacent brain" = "#5FA846"
+)
+
+idh_col <- c(
+  "IDH-mutant" = "#D9A2C8",
+  "IDH-wild-type" = "#9CC7DF",
+  "Unknown" = "#D9D9D9"
+)
+
+sex_col <- c("Female" = "#CC4F96", "Male" = "#77A6D8", "N/A" = "#D9D9D9")
+yesno_col <- c("No" = "#E8EAED", "Yes" = "#111111")
+
+grade_transition_values <- sort(unique(patient_meta$grade_transition))
+grade_transition_col <- setNames(
+  circlize::rand_color(length(grade_transition_values), luminosity = "bright"),
+  grade_transition_values
+)
+grade_transition_col["N/A"] <- "#D9D9D9"
+
+patient_meta_plot <- patient_meta %>%
+  mutate(
+    patient_name = factor(patient_name, levels = patient_order),
+    idh_status = factor(idh_status, levels = c("IDH-mutant", "IDH-wild-type", "Unknown")),
+    sex = factor(sex, levels = c("Female", "Male", "N/A")),
+    paired_TC = ifelse(has_paired_tc, "Yes", "No"),
+    paired_TE = ifelse(has_paired_te, "Yes", "No"),
+    primary_TC_TE = ifelse(has_primary_tc_te, "Yes", "No"),
+    recurrent_TC_TE = ifelse(has_recurrent_tc_te, "Yes", "No")
+  ) %>%
+  arrange(patient_name)
+
+age_vec2 <- patient_meta_plot$age_at_diagnosis
+ttp_vec2 <- patient_meta_plot$ttp_months
+os_vec2  <- patient_meta_plot$os_months
+
+age_vec2[is.na(age_vec2)] <- 0
+ttp_vec2[is.na(ttp_vec2)] <- 0
+os_vec2[is.na(os_vec2)] <- 0
+
+left_anno <- rowAnnotation(
+  IDH = patient_meta_plot$idh_status,
+  Sex = patient_meta_plot$sex,
+  `Grade\ntransition` = patient_meta_plot$grade_transition,
+  `Paired\nTC` = patient_meta_plot$paired_TC,
+  `Paired\nTE` = patient_meta_plot$paired_TE,
+  `Primary\nTC+TE` = patient_meta_plot$primary_TC_TE,
+  `Recurrent\nTC+TE` = patient_meta_plot$recurrent_TC_TE,
+  Age = anno_barplot(age_vec2, gp = gpar(fill = "#9AA3AF", col = NA), width = unit(1.6, "cm")),
+  TTP = anno_barplot(ttp_vec2, gp = gpar(fill = "#D94B42", col = NA), width = unit(1.6, "cm")),
+  OS = anno_barplot(os_vec2, gp = gpar(fill = "#111827", col = NA), width = unit(1.6, "cm")),
+  col = list(
+    IDH = idh_col,
+    Sex = sex_col,
+    `Grade\ntransition` = grade_transition_col,
+    `Paired\nTC` = yesno_col,
+    `Paired\nTE` = yesno_col,
+    `Primary\nTC+TE` = yesno_col,
+    `Recurrent\nTC+TE` = yesno_col
+  ),
+  annotation_name_gp = gpar(fontsize = 8),
+  annotation_name_side = "top"
+)
+
+col_split <- factor(
+  case_when(
+    str_detect(colnames(status_mat), "^Primary") ~ "Primary",
+    str_detect(colnames(status_mat), "^Recurrent") ~ "Recurrent",
+    str_detect(colnames(status_mat), "^SecondRec") ~ "Second recurrent",
+    TRUE ~ "Other"
+  ),
+  levels = c("Primary", "Recurrent", "Second recurrent")
+)
+
+column_labels <- c(
+  "Primary_TC" = "TC", "Primary_TE" = "TE", "Primary_AB" = "AB",
+  "Recurrent_TC" = "TC", "Recurrent_TE" = "TE", "Recurrent_AB" = "AB",
+  "SecondRec_TC" = "TC", "SecondRec_TE" = "TE", "SecondRec_AB" = "AB"
+)
+
+ht_s1a <- Heatmap(
+  status_mat,
+  name = "Sample",
+  col = status_col,
+  left_annotation = left_anno,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 7),
+  row_names_max_width = unit(3.5, "cm"),
+  show_column_names = TRUE,
+  column_labels = column_labels[colnames(status_mat)],
+  column_names_gp = gpar(fontsize = 9),
+  column_split = col_split,
+  column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+  column_gap = unit(3, "mm"),
+  rect_gp = gpar(col = "white", lwd = 0.5),
+  width = unit(8.5, "cm"),
+  height = unit(max(7, 0.22 * nrow(status_mat)), "cm"),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.rect(
+      x, y, width, height,
+      gp = gpar(fill = status_col[status_mat[i, j]], col = "white", lwd = 0.5)
+    )
+
+    sid <- sample_id_mat[i, j]
+    if (!is.na(sid) && sid != "") {
+      grid.points(x, y, pch = 16, size = unit(1.7, "mm"), gp = gpar(col = "black"))
+    }
+  }
+)
+
+pdf(
+  file.path(out_fig_dir, "FigS1A_patient_sampling_map.pdf"),
+  width = 13.5,
+  height = max(7.5, 0.28 * nrow(status_mat) + 2.5),
+  useDingbats = FALSE
+)
+draw(ht_s1a, heatmap_legend_side = "bottom", annotation_legend_side = "bottom")
+dev.off()
+
+
+## =========================================================
+## 11. Figure S1B: WHO grade transition alluvial plot
+## =========================================================
+
+grade_transition_df <- patient_tbl %>%
+  filter(primary_grade != "N/A", recurrent_grade != "N/A") %>%
+  mutate(patient_id = patient_name)
+
+p_grade_flow <- ggplot(
+  grade_transition_df,
+  aes(
+    axis1 = primary_grade,
+    axis2 = recurrent_grade,
+    y = 1
+  )
+) +
+  geom_alluvium(aes(fill = idh_status_short), width = 0.2, alpha = 0.75) +
+  geom_stratum(width = 0.2, color = "grey30", fill = "grey95") +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 3.5) +
+  scale_x_discrete(limits = c("Primary", "Recurrent"), expand = c(0.08, 0.08)) +
+  scale_fill_manual(values = c("IDH-mut" = "#2F77B4", "IDH-wt" = "#9467BD")) +
+  labs(x = NULL, y = "Patients", fill = "IDH status", title = "WHO grade transition") +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6)
+  )
+
+ggsave(
+  file.path(out_fig_dir, "FigS1B_WHO_grade_transition.pdf"),
+  p_grade_flow,
+  width = 5.2,
+  height = 4
+)
+
+
+## =========================================================
+## 12. Read protein matrix for QC and UMAP
+## =========================================================
+
+protein_mat <- read.table(
+  protein_mat_file,
+  header = TRUE,
+  row.names = 1,
+  sep = "\t",
+  check.names = FALSE
+)
+
+protein_mat <- as.matrix(protein_mat)
+storage.mode(protein_mat) <- "double"
+
+sample_meta_qc <- fig1_anno %>%
+  select(
+    sample_id,
+    region,
+    time_point,
+    sex_plot,
+    idh_status_final,
+    who_grade_plot,
+    block
+  ) %>%
+  mutate(
+    region_simple = case_when(
+      region == "Tumor core" ~ "TC",
+      region == "Tumor edge" ~ "TE",
+      region %in% c("Adjacent brain", "Non-glioma normal brain") ~ "N",
+      TRUE ~ "Unknown"
+    ),
+    idh_short = normalize_idh_short(idh_status_final)
+  )
+
+common_samples <- intersect(colnames(protein_mat), sample_meta_qc$sample_id)
+protein_mat <- protein_mat[, common_samples, drop = FALSE]
+sample_meta_qc <- sample_meta_qc %>%
+  filter(sample_id %in% common_samples) %>%
+  arrange(match(sample_id, colnames(protein_mat)))
+
+
+## =========================================================
+## 13. Figure S1C: quantified proteins per sample
+## =========================================================
+
+count_detected <- function(x, use_quantile = TRUE, p = 0.01) {
+  x <- as.numeric(x)
+  if (use_quantile) {
+    thr <- quantile(x, p, na.rm = TRUE)
+    sum(is.finite(x) & x > thr)
+  } else {
+    sum(is.finite(x) & x > 0)
+  }
+}
+
+det_counts <- sapply(protein_mat, count_detected)
+
+protein_count_df <- tibble(
+  sample_id = names(det_counts),
+  n_proteins = as.integer(det_counts)
+) %>%
+  left_join(sample_meta_qc, by = "sample_id") %>%
+  arrange(n_proteins) %>%
+  mutate(sample_ord = factor(sample_id, levels = sample_id))
+
+region_cols_simple <- c("TC" = "#C74E92", "TE" = "#E68632", "N" = "#5FA846")
+
+p_s1c <- ggplot(protein_count_df, aes(x = sample_ord, y = n_proteins, color = region_simple)) +
+  geom_segment(aes(xend = sample_ord, y = 0, yend = n_proteins), linewidth = 0.45, alpha = 0.75) +
+  geom_point(size = 2.0) +
+  scale_color_manual(values = region_cols_simple, name = "Region") +
+  labs(title = "Quantified proteins per sample", x = "Sample", y = "Protein count") +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6)
+  )
+
+ggsave(file.path(out_fig_dir, "FigS1C_proteins_per_sample.pdf"), p_s1c, width = 5.2, height = 3)
+
+
+## =========================================================
+## 14. Figure S1D: missing-value rate by region
+## =========================================================
+
+missing_rate <- apply(protein_mat, 2, function(x) mean(is.na(x)))
+
+missing_df <- tibble(
+  sample_id = names(missing_rate),
+  missing_rate = as.numeric(missing_rate)
+) %>%
+  left_join(sample_meta_qc, by = "sample_id")
+
+p_s1d <- ggplot(missing_df, aes(x = region_simple, y = missing_rate, fill = region_simple)) +
+  geom_violin(trim = FALSE, alpha = 0.45, color = NA) +
+  geom_boxplot(width = 0.18, outlier.shape = NA, color = "black", alpha = 0.9) +
+  geom_jitter(width = 0.1, size = 1.4, alpha = 0.65) +
+  scale_fill_manual(values = region_cols_simple, name = "Region") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Missing-value rate by region", x = NULL, y = "Missing-value rate") +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "none",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6)
+  )
+
+ggsave(file.path(out_fig_dir, "FigS1D_missing_rate_by_region.pdf"), p_s1d, width = 4, height = 3.2)
+
+
+## =========================================================
+## 15. Figure S1E-G: UMAP of global proteomic profiles
+## =========================================================
+
+## Select high-variable proteins.
+min_non_na_prop <- 0.70
+hv_top_n <- 2000
+
+expr <- protein_mat
+keep_rows <- rowMeans(is.finite(expr)) >= min_non_na_prop
+expr_f <- expr[keep_rows, , drop = FALSE]
+
+rv <- matrixStats::rowVars(expr_f, na.rm = TRUE)
+hv_idx <- order(rv, decreasing = TRUE)[seq_len(min(hv_top_n, length(rv)))]
+expr_hv <- expr_f[hv_idx, , drop = FALSE]
+
+## Impute remaining missing values by row means for UMAP.
+expr_hv_imp <- expr_hv
+for (i in seq_len(nrow(expr_hv_imp))) {
+  v <- expr_hv_imp[i, ]
+  v[!is.finite(v)] <- mean(v, na.rm = TRUE)
+  expr_hv_imp[i, ] <- v
+}
+
+expr_hv_z <- t(scale(t(expr_hv_imp)))
+expr_hv_z[!is.finite(expr_hv_z)] <- 0
+
+set.seed(123)
+umap_mat <- uwot::umap(
+  t(expr_hv_z),
+  n_neighbors = 15,
+  min_dist = 0.2,
+  metric = "euclidean"
+)
+
+umap_df <- as.data.frame(umap_mat) %>%
+  setNames(c("UMAP1", "UMAP2")) %>%
+  mutate(sample_id = rownames(t(expr_hv_z))) %>%
+  left_join(sample_meta_qc, by = "sample_id") %>%
+  mutate(
+    time_shape = case_when(
+      time_point == "Primary" ~ "Primary",
+      time_point == "Recurrent" ~ "Recurrent",
+      time_point == "Second recurrent" ~ "Second recurrent",
+      block == "Normal brain" ~ "Normal brain",
+      block == "Adjacent brain" ~ "Adjacent brain",
+      TRUE ~ "Other"
+    )
+  )
+
+shape_values <- c(
+  "Primary" = 16,
+  "Recurrent" = 17,
+  "Second recurrent" = 15,
+  "Adjacent brain" = 18,
+  "Normal brain" = 8,
+  "Other" = 1
+)
+
+p_umap_region <- ggplot(umap_df, aes(UMAP1, UMAP2, color = region_simple, shape = time_shape)) +
+  geom_point(size = 2.4, alpha = 0.85) +
+  scale_color_manual(values = region_cols_simple, name = "Region") +
+  scale_shape_manual(values = shape_values, name = "Time point") +
+  labs(title = "Global proteomic UMAP by region") +
+  theme_classic(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+p_umap_idh <- ggplot(umap_df, aes(UMAP1, UMAP2, color = idh_short, shape = time_shape)) +
+  geom_point(size = 2.4, alpha = 0.85) +
+  scale_color_manual(values = c("IDH-mut" = "#2F77B4", "IDH-wt" = "#9467BD", "Unknown" = "#BDBDBD"), name = "IDH") +
+  scale_shape_manual(values = shape_values, name = "Time point") +
+  labs(title = "Global proteomic UMAP by IDH") +
+  theme_classic(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+p_umap_grade <- ggplot(umap_df, aes(UMAP1, UMAP2, color = who_grade_plot, shape = time_shape)) +
+  geom_point(size = 2.4, alpha = 0.85) +
+  scale_color_manual(
+    values = c(
+      "N/A" = "#BDBDBD",
+      "Grade 1" = "#9E2F27",
+      "Grade 2" = "#B52B86",
+      "Grade 3" = "#B59930",
+      "Grade 4" = "#7F1D1D"
+    ),
+    name = "WHO grade"
+  ) +
+  scale_shape_manual(values = shape_values, name = "Time point") +
+  labs(title = "Global proteomic UMAP by WHO grade") +
+  theme_classic(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave(file.path(out_fig_dir, "FigS1E_UMAP_by_region.pdf"), p_umap_region, width = 5, height = 4)
+ggsave(file.path(out_fig_dir, "FigS1F_UMAP_by_IDH.pdf"), p_umap_idh, width = 5, height = 4)
+ggsave(file.path(out_fig_dir, "FigS1G_UMAP_by_WHO_grade.pdf"), p_umap_grade, width = 5, height = 4)
+
+
+## =========================================================
+## 16. Figure S1H-I: OS and TTP boxplots by IDH status
+## =========================================================
+
+idh_box_cols <- c("IDH-mut" = "#2F77B4", "IDH-wt" = "#9467BD")
+
+p_s1h_os <- ggplot(patient_tbl, aes(x = idh_status_short, y = os_days, fill = idh_status_short)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.75, color = "black") +
+  geom_jitter(width = 0.15, shape = 21, size = 2, alpha = 0.8) +
+  stat_compare_means(method = "wilcox.test", label = "p.format", size = 4) +
+  scale_fill_manual(values = idh_box_cols) +
+  labs(title = "Overall survival time by IDH status", x = NULL, y = "OS time (days)") +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6)
+  )
+
+p_s1i_ttp <- ggplot(patient_tbl, aes(x = idh_status_short, y = ttp_days, fill = idh_status_short)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.75, color = "black") +
+  geom_jitter(width = 0.15, shape = 21, size = 2, alpha = 0.8) +
+  stat_compare_means(method = "wilcox.test", label = "p.format", size = 4) +
+  scale_fill_manual(values = idh_box_cols) +
+  labs(title = "Time to malignant progression by IDH status", x = NULL, y = "TTP time (days)") +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6)
+  )
+
+ggsave(file.path(out_fig_dir, "FigS1H_OS_boxplot_by_IDH.pdf"), p_s1h_os, width = 4.2, height = 3.5)
+ggsave(file.path(out_fig_dir, "FigS1I_TTP_boxplot_by_IDH.pdf"), p_s1i_ttp, width = 4.2, height = 3.5)
+
+
+## =========================================================
+## 17. Cohort summary table for Figure 1A schematic
+## =========================================================
+
+fig1a_summary <- tibble(
+  item = c(
+    "Total profiled specimens",
+    "Tumor core samples",
+    "Tumor edge samples",
+    "Brain reference samples",
+    "Longitudinal glioma patients",
+    "IDH-mutant glioma patients",
+    "IDH-wild-type glioma patients"
+  ),
+  value = c(
+    nrow(fig1_anno),
+    sum(fig1_anno$region == "Tumor core", na.rm = TRUE),
+    sum(fig1_anno$region == "Tumor edge", na.rm = TRUE),
+    sum(fig1_anno$region %in% c("Adjacent brain", "Non-glioma normal brain"), na.rm = TRUE),
+    nrow(patient_tbl),
+    sum(patient_tbl$idh_status_short == "IDH-mut", na.rm = TRUE),
+    sum(patient_tbl$idh_status_short == "IDH-wt", na.rm = TRUE)
+  )
+)
+
+write.csv(
+  fig1a_summary,
+  file = file.path(out_tbl_dir, "Fig1A_cohort_summary_for_schematic.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+message("All Figure 1 and Figure S1 outputs were generated.")
+message("Tables:  ", out_tbl_dir)
+message("Figures: ", out_fig_dir)
