@@ -1,1 +1,1837 @@
+############################################################
+## Figure 2 / Figure S2 / Figure S3
+## Identification and validation of a continuous SYN–IMR
+## proteomic axis across gliomas
+##
+## Main concepts:
+##   SYN: synaptic/neural proteomic state
+##   IMR: inflammatory-matrix-remodeling proteomic state
+##   SPS: synaptic program score
+##   IMS: inflammatory-matrix remodeling score
+##   SSIprog     = SPS - IMS
+##   SSIcentroid = rho_SYN - rho_IMR
+##   SSIssg      = ssGSEA_SYN - ssGSEA_IMR
+############################################################
 
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(matrixStats)
+  library(MASS)
+  library(limma)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(RColorBrewer)
+  library(scales)
+  library(pROC)
+  library(GSVA)
+  library(ggpubr)
+  library(survival)
+  library(survminer)
+  library(vegan)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(ConsensusClusterPlus)
+  library(NMF)
+  library(glmnet)
+  library(class)
+  library(caret)
+  library(patchwork)
+})
+
+set.seed(123)
+
+############################################################
+## 0. Paths and global parameters
+############################################################
+
+ROOT_DIR <- normalizePath(".", mustWork = FALSE)
+
+DATA_DIR <- file.path(ROOT_DIR, "data")
+META_DIR <- file.path(DATA_DIR, "metadata")
+PROC_DIR <- file.path(DATA_DIR, "processed")
+EXT_DIR  <- file.path(DATA_DIR, "external")
+GSET_DIR <- file.path(DATA_DIR, "gene_sets")
+
+OUT_TBL_DIR <- file.path(ROOT_DIR, "results", "tables", "Fig2")
+OUT_FIG_DIR <- file.path(ROOT_DIR, "results", "figures", "Fig2")
+
+dir.create(OUT_TBL_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(OUT_FIG_DIR, recursive = TRUE, showWarnings = FALSE)
+
+PATH_META <- file.path(META_DIR, "sample_info.txt")
+PATH_MAT  <- file.path(PROC_DIR, "protein_matrix.txt")
+
+## Optional inputs
+PATH_EXTERNAL <- file.path(EXT_DIR, "external_IDHmut_astrocytoma_proteome.txt")
+PATH_HALLMARK <- file.path(GSET_DIR, "h.all.v2023.2.Hs.symbols.gmt")
+
+## Parameters
+tau_margin      <- 0.22
+tau_r           <- 0.055
+hv_top_n        <- 2000
+min_non_na_prop <- 0.70
+
+## Colour settings
+sub_cols <- c(
+  SYN   = "#D62728",
+  IMR   = "#1F77B4",
+  Mixed = "#00A037"
+)
+
+reg_cols <- c(
+  TC      = "#EC4899",
+  TE      = "#FF7F0E",
+  AB      = "#2CA02C",
+  Normal  = "#2CA02C",
+  Unknown = "grey70"
+)
+
+idh_cols <- c(
+  "IDH-mutant"   = "#7E57C2",
+  "IDH-wildtype" = "#26A69A",
+  "Unknown"      = "#BDBDBD"
+)
+
+time_cols <- c(
+  Primary       = "#1F77B4",
+  Recurrent     = "#FF7F0E",
+  SecondRec     = "#9467BD",
+  Reference     = "#2CA02C",
+  Unknown       = "#7F7F7F"
+)
+
+############################################################
+## 1. Helper functions
+############################################################
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+gene_symbol <- function(x) {
+  x <- as.character(x)
+  x <- ifelse(grepl("_", x), sub("^.*_", "", x), x)
+  x <- sub("\\|.*$", "", x)
+  x <- sub("\\..*$", "", x)
+  toupper(x)
+}
+
+is_ig <- function(sym) {
+  grepl("^(IGHV|IGKV|IGLV|IGHJ|IGKJ|IGLJ|IGHC|IGKC|IGLC|IG[HKL])", sym)
+}
+
+is_rbc <- function(sym) {
+  sym %in% c("HBA1", "HBA2", "HBB", "HBD", "ALAS2", "CA1", "CA2")
+}
+
+row_z <- function(M) {
+  M <- as.matrix(M)
+  Z <- t(scale(t(M)))
+  Z[!is.finite(Z)] <- NA
+  Z
+}
+
+safe_num <- function(x) {
+  suppressWarnings(as.numeric(as.character(x)))
+}
+
+first_non_na <- function(x) {
+  x <- x[!is.na(x) & x != ""]
+  if (length(x) == 0) NA else x[1]
+}
+
+infer_region <- function(x) {
+  x <- as.character(x)
+  dplyr::case_when(
+    str_detect(x, "^Chnsrmyy") ~ "TC",
+    str_detect(x, "^Bhnsrmyy") ~ "TE",
+    str_detect(x, "^Nhnsrmyy") ~ "AB",
+    TRUE                      ~ "Unknown"
+  )
+}
+
+infer_timepoint_from_sample <- function(x) {
+  x <- as.character(x)
+  dplyr::case_when(
+    str_detect(x, "hnsrmyy1") ~ "Primary",
+    str_detect(x, "hnsrmyy2") ~ "Recurrent",
+    str_detect(x, "hnsrmyy3") ~ "SecondRec",
+    str_detect(x, "^Nhnsrmyy") ~ "Reference",
+    TRUE ~ "Unknown"
+  )
+}
+
+normalize_idh <- function(x) {
+  x <- as.character(x)
+  dplyr::case_when(
+    str_detect(x, "突变|mut|MUT|IDH-MUT|IDH mutant") ~ "IDH-mutant",
+    str_detect(x, "野生|wt|WT|IDH-WT|IDH wild") ~ "IDH-wildtype",
+    TRUE ~ "Unknown"
+  )
+}
+
+normalize_grade <- function(x) {
+  x <- as.character(x)
+  dplyr::case_when(
+    str_detect(x, "2|II") ~ "G2",
+    str_detect(x, "3|III") ~ "G3",
+    str_detect(x, "4|IV") ~ "G4",
+    TRUE ~ "Unknown"
+  )
+}
+
+save_pdf_png <- function(plot, filename, width = 6, height = 4) {
+  ggsave(
+    file.path(OUT_FIG_DIR, paste0(filename, ".pdf")),
+    plot, width = width, height = height, useDingbats = FALSE
+  )
+  ggsave(
+    file.path(OUT_FIG_DIR, paste0(filename, ".png")),
+    plot, width = width, height = height, dpi = 300
+  )
+}
+
+plasma_core <- c(
+  "ALB", "A1BG", "HP", "HPX", "HRG", "TF", "PLG",
+  "APOA1", "APOA2", "APOB", "APOC1", "APOC2", "APOC3",
+  "APOE", "APOD", "APOH", "CLU",
+  "C3", "C4A", "C4B", "C5", "C6", "C7", "C8A", "C8B", "C8G", "C9",
+  "CFH", "CFI", "CFB",
+  "SERPINA1", "SERPINA3", "SERPINC1", "SERPIND1", "SERPINF2", "SERPING1",
+  "ITIH1", "ITIH2", "ITIH3", "ITIH4",
+  "FGA", "FGB", "FGG", "KNG1", "VTN", "AHSG",
+  "ORM1", "ORM2", "SAA1", "SAA2", "CRP", "GC"
+)
+
+############################################################
+## 2. Data loading and metadata harmonization
+############################################################
+
+meta_all <- read.table(
+  PATH_META,
+  sep = "\t",
+  header = TRUE,
+  row.names = 1,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+protein_df <- read.table(
+  PATH_MAT,
+  header = TRUE,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+protein_mat <- as.matrix(protein_df)
+storage.mode(protein_mat) <- "double"
+
+if (is.null(rownames(protein_mat))) {
+  stop("protein_matrix.txt must contain protein IDs as row names.")
+}
+
+rownames(protein_mat) <- gene_symbol(rownames(protein_mat))
+
+## 如果原始 meta 中中文列名不同，可在这里统一
+if ("进展时间（天）" %in% colnames(meta_all)) {
+  meta_all$Progress_time <- meta_all$`进展时间（天）`
+}
+if ("生存时间" %in% colnames(meta_all)) {
+  meta_all$Survival_time <- meta_all$生存时间
+}
+
+sample_meta <- meta_all %>%
+  mutate(
+    Sample = if ("编号" %in% names(.)) 编号 else rownames(.),
+    PatientID = if ("PatientID" %in% names(.)) PatientID else 姓名,
+    Region = if ("TissueRegion" %in% names(.)) TissueRegion else infer_region(Sample),
+    Region = case_when(
+      Region %in% c("C", "Center", "TC", "Tumor core") ~ "TC",
+      Region %in% c("E", "Edge", "TE", "Tumor edge") ~ "TE",
+      Region %in% c("N", "AB", "Normal", "Adjacent brain") ~ "AB",
+      TRUE ~ infer_region(Sample)
+    ),
+    TimePoint = if ("TimePoint" %in% names(.)) TimePoint else infer_timepoint_from_sample(Sample),
+    TimePoint = case_when(
+      TimePoint %in% c("Primary", "初发", "C1", "1") ~ "Primary",
+      TimePoint %in% c("Recurrent", "复发", "C2", "2") ~ "Recurrent",
+      TimePoint %in% c("SecondRec", "Second recurrent", "C3", "3") ~ "SecondRec",
+      TRUE ~ infer_timepoint_from_sample(Sample)
+    ),
+    IDH_raw = if ("IDHStatus" %in% names(.)) IDHStatus else if ("分子状态" %in% names(.)) 分子状态 else NA_character_,
+    IDH = normalize_idh(IDH_raw),
+    WHO_grade = if ("WHO级别" %in% names(.)) normalize_grade(`WHO级别`) else "Unknown",
+    Progress_time = safe_num(Progress_time),
+    Survival_time = safe_num(Survival_time)
+  ) %>%
+  dplyr::select(
+    Sample, PatientID, Region, TimePoint, IDH, WHO_grade,
+    Progress_time, Survival_time, everything()
+  )
+
+## 对齐矩阵和 metadata
+valid_samples <- intersect(colnames(protein_mat), sample_meta$Sample)
+protein_mat <- protein_mat[, valid_samples, drop = FALSE]
+sample_meta <- sample_meta %>%
+  filter(Sample %in% valid_samples) %>%
+  arrange(match(Sample, colnames(protein_mat)))
+
+write.csv(
+  sample_meta,
+  file.path(OUT_TBL_DIR, "Fig2_sample_metadata_harmonized.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 3. Discovery cohort: primary TC samples
+############################################################
+
+discovery_meta <- sample_meta %>%
+  filter(Region == "TC", TimePoint == "Primary")
+
+discovery_samples <- discovery_meta$Sample
+discovery_mat <- protein_mat[, discovery_samples, drop = FALSE]
+
+## 可选：如果你已经有手动标注的 discovery SYN / IMR 标签，可以在这里读入
+## 格式：Sample, Subtype，其中 Subtype 为 SYN 或 IMR
+PATH_DISCOVERY_LABEL <- file.path(META_DIR, "Fig2_discovery_SYN_IMR_labels.csv")
+
+if (file.exists(PATH_DISCOVERY_LABEL)) {
+  discovery_label_df <- read.csv(PATH_DISCOVERY_LABEL, stringsAsFactors = FALSE) %>%
+    mutate(Subtype = factor(Subtype, levels = c("SYN", "IMR")))
+} else {
+  message("No external discovery label file detected. Consensus/NMF section will generate candidate classes.")
+  discovery_label_df <- NULL
+}
+
+############################################################
+## 4. Figure S2B-D: consensus clustering and NMF robustness
+############################################################
+
+## 4.1 High-variance matrix for discovery cohort
+keep_rows <- rowMeans(is.finite(discovery_mat)) >= min_non_na_prop
+disc_filt <- discovery_mat[keep_rows, , drop = FALSE]
+
+rv <- rowVars(disc_filt, na.rm = TRUE)
+hv_idx <- order(rv, decreasing = TRUE)[seq_len(min(hv_top_n, length(rv)))]
+disc_hv <- disc_filt[hv_idx, , drop = FALSE]
+
+disc_z <- row_z(disc_hv)
+disc_z[is.na(disc_z)] <- 0
+
+## 4.2 Consensus clustering
+cc_outdir <- file.path(OUT_TBL_DIR, "ConsensusClusterPlus")
+dir.create(cc_outdir, recursive = TRUE, showWarnings = FALSE)
+
+cc_res <- ConsensusClusterPlus(
+  as.matrix(disc_z),
+  maxK = 6,
+  reps = 1000,
+  pItem = 0.8,
+  pFeature = 0.8,
+  clusterAlg = "hc",
+  distance = "pearson",
+  seed = 123,
+  plot = "pdf",
+  title = cc_outdir
+)
+
+## Extract k = 2 consensus assignment
+consensus_k2 <- cc_res[[2]]$consensusClass
+consensus_df <- tibble(
+  Sample = names(consensus_k2),
+  Consensus_k2 = paste0("C", as.integer(consensus_k2))
+)
+
+write.csv(
+  consensus_df,
+  file.path(OUT_TBL_DIR, "FigS2D_consensus_k2_assignment.csv"),
+  row.names = FALSE
+)
+
+## 4.3 NMF rank survey
+nmf_input <- disc_z
+nmf_input[nmf_input < 0] <- 0
+
+nmf_rank <- nmf::nmfEstimateRank(
+  nmf_input,
+  rank = 2:6,
+  method = "brunet",
+  nrun = 50,
+  seed = 123
+)
+
+pdf(file.path(OUT_FIG_DIR, "FigS2C_NMF_rank_survey.pdf"), width = 8, height = 6)
+plot(nmf_rank)
+dev.off()
+
+nmf_k2 <- nmf::nmf(nmf_input, rank = 2, method = "brunet", nrun = 100, seed = 123)
+nmf_group <- predict(nmf_k2)
+
+nmf_df <- tibble(
+  Sample = names(nmf_group),
+  NMF_k2 = paste0("NMF", as.integer(nmf_group))
+)
+
+write.csv(
+  nmf_df,
+  file.path(OUT_TBL_DIR, "FigS2C_NMF_k2_assignment.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 5. Define SYN and IMR classes in discovery cohort
+############################################################
+
+## 推荐做法：
+## 1) 用 consensus / NMF 得到两个稳定组；
+## 2) 根据差异蛋白和GO结果，人工确认哪一组是 SYN，哪一组是 IMR；
+## 3) 保存 Fig2_discovery_SYN_IMR_labels.csv，之后脚本直接读取。
+
+if (is.null(discovery_label_df)) {
+  ## 临时自动标签：按 NMF_k2 赋值。
+  ## 注意：这一步需要你根据生物学结果确认方向。
+  discovery_label_df <- consensus_df %>%
+    rename(tmp_group = Consensus_k2) %>%
+    mutate(
+      Subtype = case_when(
+        tmp_group == "C1" ~ "SYN",
+        tmp_group == "C2" ~ "IMR",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    dplyr::select(Sample, Subtype)
+
+  write.csv(
+    discovery_label_df,
+    file.path(OUT_TBL_DIR, "CHECK_Fig2_discovery_SYN_IMR_labels_auto.csv"),
+    row.names = FALSE
+  )
+
+  warning(
+    "SYN/IMR labels were assigned automatically from consensus clusters. ",
+    "Please inspect marker proteins and GO enrichment, then save a curated ",
+    "Fig2_discovery_SYN_IMR_labels.csv file."
+  )
+}
+
+discovery_label_df <- discovery_label_df %>%
+  filter(Sample %in% colnames(discovery_mat)) %>%
+  mutate(Subtype = factor(Subtype, levels = c("SYN", "IMR")))
+
+############################################################
+## 6. Figure 2B / Figure S2F:
+## Differential abundance between IMR and SYN
+############################################################
+
+disc_for_de <- discovery_mat[, discovery_label_df$Sample, drop = FALSE]
+disc_for_de_z <- row_z(disc_for_de)
+
+design <- model.matrix(~ 0 + discovery_label_df$Subtype)
+colnames(design) <- levels(discovery_label_df$Subtype)
+
+fit <- lmFit(disc_for_de_z, design)
+contrast <- makeContrasts(IMR_vs_SYN = IMR - SYN, levels = design)
+fit2 <- contrasts.fit(fit, contrast)
+fit2 <- eBayes(fit2)
+
+deg_df <- topTable(
+  fit2,
+  coef = "IMR_vs_SYN",
+  number = Inf,
+  adjust.method = "BH",
+  sort.by = "P"
+) %>%
+  rownames_to_column("Protein") %>%
+  mutate(
+    Symbol = gene_symbol(Protein),
+    Direction = case_when(
+      adj.P.Val < 0.05 & logFC > 0 ~ "IMR",
+      adj.P.Val < 0.05 & logFC < 0 ~ "SYN",
+      TRUE ~ "NS"
+    )
+  )
+
+write.csv(
+  deg_df,
+  file.path(OUT_TBL_DIR, "Fig2B_FigS2F_DEG_IMR_vs_SYN_limma.csv"),
+  row.names = FALSE
+)
+
+## Core signatures
+topN_signature <- 200
+
+syn_genes <- deg_df %>%
+  filter(Direction == "SYN") %>%
+  arrange(adj.P.Val, logFC) %>%
+  filter(!is_ig(Symbol), !is_rbc(Symbol)) %>%
+  slice_head(n = topN_signature) %>%
+  pull(Symbol) %>%
+  unique()
+
+imr_genes <- deg_df %>%
+  filter(Direction == "IMR") %>%
+  arrange(adj.P.Val, desc(logFC)) %>%
+  filter(!is_ig(Symbol), !is_rbc(Symbol)) %>%
+  slice_head(n = topN_signature) %>%
+  pull(Symbol) %>%
+  unique()
+
+signature_tbl <- tibble(
+  Symbol = c(syn_genes, imr_genes),
+  Program = c(rep("SYN", length(syn_genes)), rep("IMR", length(imr_genes)))
+)
+
+write.csv(
+  signature_tbl,
+  file.path(OUT_TBL_DIR, "Fig2_SYN_IMR_signature_proteins.csv"),
+  row.names = FALSE
+)
+
+## Figure S2F: volcano plot
+p_volcano <- deg_df %>%
+  mutate(
+    neglogFDR = -log10(pmax(adj.P.Val, 1e-300)),
+    Direction = factor(Direction, levels = c("SYN", "IMR", "NS"))
+  ) %>%
+  ggplot(aes(x = logFC, y = neglogFDR, color = Direction)) +
+  geom_point(size = 1.4, alpha = 0.75) +
+  scale_color_manual(
+    values = c(SYN = "#1F77B4", IMR = "#D62728", NS = "grey75"),
+    drop = FALSE
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.3) +
+  labs(
+    x = "log2 fold change: IMR vs SYN",
+    y = "-log10(FDR)",
+    title = "Differential protein abundance between IMR and SYN"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6))
+
+save_pdf_png(p_volcano, "FigS2F_volcano_IMR_vs_SYN", width = 5, height = 4)
+
+############################################################
+## 7. Figure 2B: heatmap of representative differential proteins
+############################################################
+
+representative_syn <- syn_genes[seq_len(min(30, length(syn_genes)))]
+representative_imr <- imr_genes[seq_len(min(30, length(imr_genes)))]
+rep_genes <- unique(c(representative_syn, representative_imr))
+
+heat_mat <- disc_for_de_z[rownames(disc_for_de_z) %in% rep_genes, , drop = FALSE]
+heat_mat <- heat_mat[match(rep_genes, rownames(heat_mat)), , drop = FALSE]
+heat_mat <- heat_mat[complete.cases(heat_mat), , drop = FALSE]
+
+col_order <- discovery_label_df %>%
+  arrange(Subtype, Sample) %>%
+  pull(Sample)
+
+heat_mat <- heat_mat[, col_order, drop = FALSE]
+
+top_anno <- discovery_label_df %>%
+  left_join(sample_meta %>% dplyr::select(Sample, IDH), by = "Sample") %>%
+  arrange(match(Sample, col_order))
+
+ha <- HeatmapAnnotation(
+  Subtype = top_anno$Subtype,
+  IDH = top_anno$IDH,
+  col = list(
+    Subtype = c(SYN = sub_cols["SYN"], IMR = sub_cols["IMR"]),
+    IDH = idh_cols
+  ),
+  annotation_name_side = "left",
+  gp = gpar(col = NA)
+)
+
+row_program <- ifelse(rownames(heat_mat) %in% syn_genes, "SYN", "IMR")
+row_split <- factor(row_program, levels = c("SYN", "IMR"))
+
+pdf(file.path(OUT_FIG_DIR, "Fig2B_representative_DE_protein_heatmap.pdf"), width = 6.5, height = 7.5)
+Heatmap(
+  heat_mat,
+  name = "z-score",
+  col = colorRamp2(c(-2, 0, 2), c("#2166AC", "#F7F7F7", "#B2182B")),
+  top_annotation = ha,
+  row_split = row_split,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  show_column_names = FALSE,
+  show_row_names = TRUE,
+  row_names_gp = gpar(
+    fontsize = 7,
+    col = ifelse(rownames(heat_mat) %in% syn_genes, "#1F77B4", "#D62728")
+  ),
+  column_title = "Representative proteins defining SYN and IMR states"
+)
+dev.off()
+
+############################################################
+## 8. Figure 2C: GO enrichment for SYN and IMR proteins
+############################################################
+
+run_go <- function(symbols, ont = "BP") {
+  eg <- bitr(
+    symbols,
+    fromType = "SYMBOL",
+    toType = "ENTREZID",
+    OrgDb = org.Hs.eg.db
+  )
+
+  enrichGO(
+    gene = unique(eg$ENTREZID),
+    OrgDb = org.Hs.eg.db,
+    keyType = "ENTREZID",
+    ont = ont,
+    pAdjustMethod = "BH",
+    readable = TRUE
+  ) %>%
+    as.data.frame()
+}
+
+go_syn <- run_go(syn_genes, ont = "BP") %>%
+  mutate(Program = "SYN")
+
+go_imr <- run_go(imr_genes, ont = "BP") %>%
+  mutate(Program = "IMR")
+
+go_df <- bind_rows(go_syn, go_imr)
+
+write.csv(
+  go_df,
+  file.path(OUT_TBL_DIR, "Fig2C_GO_enrichment_SYN_IMR.csv"),
+  row.names = FALSE
+)
+
+go_plot_df <- go_df %>%
+  group_by(Program) %>%
+  arrange(p.adjust, .by_group = TRUE) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  mutate(
+    Description = str_wrap(Description, width = 45),
+    neglogq = -log10(pmax(p.adjust, 1e-300)),
+    Description = fct_reorder(Description, neglogq)
+  )
+
+p_go <- ggplot(go_plot_df, aes(x = neglogq, y = Description, fill = Program)) +
+  geom_col(width = 0.75) +
+  facet_wrap(~ Program, scales = "free_y", ncol = 1) +
+  scale_fill_manual(values = c(SYN = "#1F77B4", IMR = "#D62728")) +
+  labs(
+    x = "-log10(q value)",
+    y = NULL,
+    title = "GO enrichment of SYN- and IMR-associated proteins"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.5)
+  )
+
+save_pdf_png(p_go, "Fig2C_GO_enrichment_SYN_IMR", width = 7, height = 7)
+
+############################################################
+## 9. Figure S2E: PCA of discovery cohort
+############################################################
+
+pca <- prcomp(t(disc_z), scale. = FALSE)
+
+pca_df <- as.data.frame(pca$x[, 1:2]) %>%
+  rownames_to_column("Sample") %>%
+  left_join(discovery_label_df, by = "Sample") %>%
+  left_join(sample_meta %>% dplyr::select(Sample, IDH), by = "Sample")
+
+pc_var <- summary(pca)$importance[2, 1:2] * 100
+
+p_pca <- ggplot(pca_df, aes(PC1, PC2, color = Subtype)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(aes(group = Subtype), linetype = "dashed", linewidth = 0.6) +
+  scale_color_manual(values = c(SYN = sub_cols["SYN"], IMR = sub_cols["IMR"])) +
+  labs(
+    x = paste0("PC1 (", round(pc_var[1], 1), "%)"),
+    y = paste0("PC2 (", round(pc_var[2], 1), "%)"),
+    title = "PCA of primary TC proteomes"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6))
+
+save_pdf_png(p_pca, "FigS2E_PCA_SYN_IMR_discovery", width = 5, height = 4)
+
+############################################################
+## 10. Build centroid classifier and project full cohort
+############################################################
+
+build_centroid_model <- function(train_mat, label_df, plasma_correct = TRUE, use_pc1 = TRUE) {
+  stopifnot(is.matrix(train_mat))
+
+  label_df <- label_df %>%
+    filter(Sample %in% colnames(train_mat)) %>%
+    arrange(match(Sample, colnames(train_mat)))
+
+  train_mat <- train_mat[, label_df$Sample, drop = FALSE]
+
+  sym <- gene_symbol(rownames(train_mat))
+  keep_hard <- !(is_ig(sym) | is_rbc(sym))
+
+  X <- train_mat[keep_hard, , drop = FALSE]
+
+  mu <- rowMeans(X, na.rm = TRUE)
+  sd <- rowSds(X, na.rm = TRUE)
+  sd[sd == 0 | !is.finite(sd)] <- 1
+
+  z <- sweep(X, 1, mu, "-")
+  z <- sweep(z, 1, sd, "/")
+
+  ps <- rep(0, ncol(train_mat))
+  names(ps) <- colnames(train_mat)
+
+  if (plasma_correct) {
+    z_all <- row_z(train_mat)
+    z_all[is.na(z_all)] <- 0
+
+    sel <- which(gene_symbol(rownames(z_all)) %in% plasma_core)
+
+    if (length(sel) >= 10) {
+      ps <- if (use_pc1) {
+        prcomp(t(z_all[sel, , drop = FALSE]), scale. = FALSE)$x[, 1]
+      } else {
+        colMeans(z_all[sel, , drop = FALSE], na.rm = TRUE)
+      }
+      ps <- setNames(as.numeric(ps), colnames(train_mat))
+    }
+  }
+
+  if (plasma_correct) {
+    beta <- apply(z, 1, function(y) {
+      ok <- is.finite(y) & is.finite(ps)
+      if (sum(ok) < 8) return(0)
+      as.numeric(coef(MASS::rlm(y[ok] ~ ps[ok]))[2])
+    })
+
+    beta[!is.finite(beta)] <- 0
+    z_res <- z - beta %o% ps[colnames(z)]
+  } else {
+    beta <- rep(0, nrow(z))
+    names(beta) <- rownames(z)
+    z_res <- z
+  }
+
+  lab <- label_df$Subtype
+  names(lab) <- label_df$Sample
+
+  cent_SYN <- rowMeans(z_res[, lab[colnames(z_res)] == "SYN", drop = FALSE], na.rm = TRUE)
+  cent_IMR <- rowMeans(z_res[, lab[colnames(z_res)] == "IMR", drop = FALSE], na.rm = TRUE)
+
+  list(
+    genes = names(mu),
+    mu = mu,
+    sd = sd,
+    beta = beta,
+    plasma_correct = plasma_correct,
+    use_pc1 = use_pc1,
+    cent_SYN = cent_SYN,
+    cent_IMR = cent_IMR,
+    train_labels = label_df
+  )
+}
+
+project_centroid_model <- function(model, mat, tau_margin = 0.22, tau_r = 0.055) {
+  X0 <- as.matrix(mat)
+  storage.mode(X0) <- "double"
+
+  genes <- intersect(model$genes, rownames(X0))
+  X <- X0[genes, , drop = FALSE]
+
+  zX <- sweep(X, 1, model$mu[genes], "-")
+  zX <- sweep(zX, 1, model$sd[genes], "/")
+
+  ps_all <- rep(0, ncol(X0))
+  names(ps_all) <- colnames(X0)
+
+  if (model$plasma_correct) {
+    z_all <- row_z(X0)
+    z_all[is.na(z_all)] <- 0
+
+    sel <- which(gene_symbol(rownames(z_all)) %in% plasma_core)
+
+    if (length(sel) >= 10) {
+      ps_all <- if (isTRUE(model$use_pc1)) {
+        prcomp(t(z_all[sel, , drop = FALSE]), scale. = FALSE)$x[, 1]
+      } else {
+        colMeans(z_all[sel, , drop = FALSE], na.rm = TRUE)
+      }
+      ps_all <- setNames(as.numeric(ps_all), colnames(X0))
+    }
+  }
+
+  if (model$plasma_correct) {
+    b <- model$beta[genes]
+    b[!is.finite(b)] <- 0
+    zX_res <- zX - b %o% ps_all[colnames(zX)]
+  } else {
+    zX_res <- zX
+  }
+
+  sp_cor <- function(x, y) {
+    suppressWarnings(cor(x, y, method = "spearman", use = "pairwise.complete.obs"))
+  }
+
+  rho_SYN <- apply(zX_res, 2, function(v) sp_cor(v, model$cent_SYN[genes]))
+  rho_IMR <- apply(zX_res, 2, function(v) sp_cor(v, model$cent_IMR[genes]))
+
+  SSIcentroid <- rho_SYN - rho_IMR
+  MaxR <- pmax(rho_SYN, rho_IMR)
+
+  PredSubtype <- ifelse(
+    MaxR < tau_r,
+    "Mixed",
+    ifelse(
+      abs(SSIcentroid) < tau_margin,
+      "Mixed",
+      ifelse(rho_SYN >= rho_IMR, "SYN", "IMR")
+    )
+  )
+
+  res <- tibble(
+    Sample = colnames(zX_res),
+    rho_SYN = as.numeric(rho_SYN),
+    rho_IMR = as.numeric(rho_IMR),
+    SSIcentroid = as.numeric(SSIcentroid),
+    MaxR = as.numeric(MaxR),
+    PlasmaScore = as.numeric(ps_all[colnames(zX_res)]),
+    PredSubtype = factor(PredSubtype, levels = c("SYN", "IMR", "Mixed"))
+  )
+
+  train_df <- model$train_labels
+  train_samps <- intersect(train_df$Sample, res$Sample)
+
+  if (length(train_samps) > 0) {
+    res <- res %>%
+      left_join(
+        train_df %>% dplyr::select(Sample, TrueSubtype = Subtype),
+        by = "Sample"
+      )
+
+    ## Discovery set uses curated labels
+    res$PredSubtype[match(train_samps, res$Sample)] <-
+      res$TrueSubtype[match(train_samps, res$Sample)]
+  } else {
+    res$TrueSubtype <- NA_character_
+  }
+
+  res
+}
+
+centroid_model_raw <- build_centroid_model(
+  discovery_mat,
+  discovery_label_df,
+  plasma_correct = FALSE
+)
+
+centroid_model_cor <- build_centroid_model(
+  discovery_mat,
+  discovery_label_df,
+  plasma_correct = TRUE,
+  use_pc1 = TRUE
+)
+
+pred_raw <- project_centroid_model(
+  centroid_model_raw,
+  protein_mat,
+  tau_margin = tau_margin,
+  tau_r = tau_r
+) %>%
+  mutate(Region = infer_region(Sample))
+
+pred_cor <- project_centroid_model(
+  centroid_model_cor,
+  protein_mat,
+  tau_margin = tau_margin,
+  tau_r = tau_r
+) %>%
+  mutate(Region = infer_region(Sample)) %>%
+  left_join(
+    sample_meta %>% dplyr::select(Sample, PatientID, TimePoint, IDH, WHO_grade, Progress_time, Survival_time),
+    by = "Sample"
+  )
+
+write.csv(
+  pred_cor,
+  file.path(OUT_TBL_DIR, "Fig2_centroid_projection_full_cohort.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 11. SPS / IMS / SSIprog calculation
+############################################################
+
+Z_all <- row_z(protein_mat)
+rownames(Z_all) <- gene_symbol(rownames(Z_all))
+
+sps_set <- intersect(syn_genes, rownames(Z_all))
+ims_set <- intersect(imr_genes, rownames(Z_all))
+
+program_score <- function(Z, target_set) {
+  target <- colMeans(Z[rownames(Z) %in% target_set, , drop = FALSE], na.rm = TRUE)
+  other  <- colMeans(Z[!(rownames(Z) %in% target_set), , drop = FALSE], na.rm = TRUE)
+  target - other
+}
+
+SPS <- program_score(Z_all, sps_set)
+IMS <- program_score(Z_all, ims_set)
+
+prog_df <- tibble(
+  Sample = colnames(Z_all),
+  SPS = as.numeric(SPS),
+  IMS = as.numeric(IMS),
+  SSIprog = as.numeric(SPS - IMS)
+) %>%
+  left_join(
+    pred_cor %>% dplyr::select(Sample, PredSubtype, Region, PatientID, TimePoint, IDH, WHO_grade, Progress_time, Survival_time),
+    by = "Sample"
+  ) %>%
+  mutate(
+    PredSubtype = factor(PredSubtype, levels = c("SYN", "IMR", "Mixed"))
+  )
+
+write.csv(
+  prog_df,
+  file.path(OUT_TBL_DIR, "Fig2_program_scores_SPS_IMS_SSIprog.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 12. Figure 2G: discovery samples in SPS-IMS space
+############################################################
+
+p_2g <- prog_df %>%
+  filter(Sample %in% discovery_label_df$Sample) %>%
+  left_join(discovery_label_df %>% rename(DiscoverySubtype = Subtype), by = "Sample") %>%
+  ggplot(aes(x = SPS, y = IMS, color = DiscoverySubtype)) +
+  geom_point(size = 3, alpha = 0.9) +
+  stat_ellipse(aes(group = DiscoverySubtype), linetype = "dashed", linewidth = 0.6) +
+  scale_color_manual(values = c(SYN = sub_cols["SYN"], IMR = sub_cols["IMR"])) +
+  labs(
+    x = "SPS",
+    y = "IMS",
+    title = "Discovery primary TC samples in SPS-IMS space"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6))
+
+save_pdf_png(p_2g, "Fig2G_discovery_SPS_IMS_space", width = 5, height = 4)
+
+############################################################
+## 13. Figure 2H: full tumor cohort projection
+############################################################
+
+p_2h <- prog_df %>%
+  filter(Region %in% c("TC", "TE")) %>%
+  ggplot(aes(x = SPS, y = IMS, color = PredSubtype)) +
+  geom_density_2d_filled(alpha = 0.25, bins = 8, show.legend = FALSE) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_color_manual(values = sub_cols, drop = FALSE) +
+  labs(
+    x = "SPS",
+    y = "IMS",
+    title = "Full tumor cohort projected onto SPS-IMS space"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6))
+
+save_pdf_png(p_2h, "Fig2H_full_tumor_cohort_SPS_IMS_space", width = 5.2, height = 4.2)
+
+############################################################
+## 14. Figure 2I: ROC of SSIprog for SYN vs IMR
+############################################################
+
+roc_df <- prog_df %>%
+  filter(Region %in% c("TC", "TE"), PredSubtype %in% c("SYN", "IMR")) %>%
+  mutate(PredSubtype = factor(PredSubtype, levels = c("IMR", "SYN")))
+
+roc_ssi <- roc(
+  response = roc_df$PredSubtype,
+  predictor = roc_df$SSIprog,
+  levels = c("IMR", "SYN"),
+  direction = "<",
+  quiet = TRUE
+)
+
+auc_ssi <- as.numeric(auc(roc_ssi))
+
+pdf(file.path(OUT_FIG_DIR, "Fig2I_ROC_SSIprog_SYN_vs_IMR.pdf"), width = 4.3, height = 4.3)
+plot(
+  roc_ssi,
+  print.auc = TRUE,
+  col = "#FE9929",
+  lwd = 2,
+  legacy.axes = TRUE,
+  main = "SSIprog distinguishes SYN and IMR"
+)
+dev.off()
+
+write.csv(
+  tibble(AUC = auc_ssi),
+  file.path(OUT_TBL_DIR, "Fig2I_ROC_AUC_SSIprog.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 15. Figure 2D-E-F: clinical association
+############################################################
+
+patient_level <- prog_df %>%
+  filter(Region == "TC", TimePoint == "Primary") %>%
+  group_by(PatientID) %>%
+  summarise(
+    PredSubtype = first_non_na(as.character(PredSubtype)),
+    IDH = first_non_na(IDH),
+    WHO_grade = first_non_na(WHO_grade),
+    Progress_time = first_non_na(Progress_time),
+    Survival_time = first_non_na(Survival_time),
+    .groups = "drop"
+  ) %>%
+  filter(PredSubtype %in% c("SYN", "IMR")) %>%
+  mutate(
+    PredSubtype = factor(PredSubtype, levels = c("SYN", "IMR")),
+    Progress_time = safe_num(Progress_time),
+    Survival_time = safe_num(Survival_time)
+  )
+
+write.csv(
+  patient_level,
+  file.path(OUT_TBL_DIR, "Fig2_patient_level_clinical_SYN_IMR.csv"),
+  row.names = FALSE
+)
+
+plot_clin_box <- function(dat, yvar, ylab, title) {
+  ggplot(dat, aes(x = PredSubtype, y = .data[[yvar]], fill = PredSubtype)) +
+    geom_boxplot(width = 0.58, outlier.shape = NA, alpha = 0.65) +
+    geom_jitter(width = 0.12, size = 2.4, alpha = 0.8) +
+    stat_compare_means(method = "wilcox.test", label = "p.format") +
+    scale_fill_manual(values = c(SYN = sub_cols["SYN"], IMR = sub_cols["IMR"])) +
+    labs(x = NULL, y = ylab, title = title) +
+    theme_classic(base_size = 12) +
+    theme(
+      legend.position = "none",
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6)
+    )
+}
+
+p_2d <- plot_clin_box(
+  patient_level,
+  "Progress_time",
+  "Time to malignant progression, days",
+  "Progression time by SYN/IMR subtype"
+)
+
+p_2e <- plot_clin_box(
+  patient_level,
+  "Survival_time",
+  "Overall survival time, days",
+  "Overall survival by SYN/IMR subtype"
+)
+
+save_pdf_png(p_2d, "Fig2D_progression_time_by_SYN_IMR", width = 4, height = 4)
+save_pdf_png(p_2e, "Fig2E_survival_time_by_SYN_IMR", width = 4, height = 4)
+
+## KM overall survival
+## 如果你有真实 censor/event 信息，请替换 OS_event。
+## 这里默认 Survival_time 非 NA 的患者为 event = 1，不建议作为最终发表版本。
+patient_level <- patient_level %>%
+  mutate(OS_event = ifelse(!is.na(Survival_time), 1, NA_real_)) %>%
+  filter(!is.na(Survival_time), !is.na(OS_event))
+
+fit_os <- survfit(
+  Surv(Survival_time, OS_event) ~ PredSubtype,
+  data = patient_level
+)
+
+p_2f <- ggsurvplot(
+  fit_os,
+  data = patient_level,
+  risk.table = FALSE,
+  pval = TRUE,
+  conf.int = FALSE,
+  censor = TRUE,
+  surv.median.line = "hv",
+  palette = c(SYN = sub_cols["SYN"], IMR = sub_cols["IMR"]),
+  legend.title = NULL,
+  legend.labs = c("SYN", "IMR"),
+  xlab = "Overall survival time, days",
+  ylab = "Overall survival probability"
+)
+
+pdf(file.path(OUT_FIG_DIR, "Fig2F_KM_OS_SYN_IMR.pdf"), width = 5, height = 4.5)
+print(p_2f)
+dev.off()
+
+############################################################
+## 16. Figure 2J: PERMANOVA variance partitioning
+############################################################
+
+X <- protein_mat
+keep_rows <- rowMeans(is.finite(X)) >= min_non_na_prop
+Xf <- X[keep_rows, , drop = FALSE]
+
+rv <- rowVars(Xf, na.rm = TRUE)
+hv_idx <- order(rv, decreasing = TRUE)[seq_len(min(hv_top_n, length(rv)))]
+Xh <- Xf[hv_idx, , drop = FALSE]
+
+Xz <- row_z(Xh)
+Xz[is.na(Xz)] <- 0
+
+perm_meta <- pred_cor %>%
+  filter(Sample %in% colnames(Xz)) %>%
+  mutate(
+    PredSubtype = factor(PredSubtype, levels = c("SYN", "IMR", "Mixed")),
+    Region = factor(Region, levels = c("TC", "TE", "AB", "Unknown")),
+    TimePoint = factor(TimePoint, levels = c("Primary", "Recurrent", "SecondRec", "Reference", "Unknown")),
+    IDH = factor(IDH, levels = c("IDH-mutant", "IDH-wildtype", "Unknown")),
+    PatientID = factor(PatientID)
+  ) %>%
+  filter(!is.na(PredSubtype), !is.na(Region), !is.na(TimePoint), !is.na(IDH))
+
+Xz_perm <- Xz[, perm_meta$Sample, drop = FALSE]
+D <- dist(t(Xz_perm), method = "euclidean")
+
+fit_perm <- adonis2(
+  D ~ IDH + TimePoint + Region + PredSubtype,
+  data = perm_meta,
+  permutations = 9999,
+  strata = perm_meta$PatientID,
+  by = "margin"
+)
+
+perm_df <- as.data.frame(fit_perm) %>%
+  rownames_to_column("Variable") %>%
+  filter(Variable %in% c("IDH", "TimePoint", "Region", "PredSubtype")) %>%
+  mutate(
+    Variable = recode(
+      Variable,
+      IDH = "IDH status",
+      TimePoint = "Sampling time point",
+      Region = "Anatomical region",
+      PredSubtype = "Predicted proteomic subtype"
+    ),
+    p_label = case_when(
+      `Pr(>F)` < 0.001 ~ "***",
+      `Pr(>F)` < 0.01 ~ "**",
+      `Pr(>F)` < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+write.csv(
+  perm_df,
+  file.path(OUT_TBL_DIR, "Fig2J_PERMANOVA_variance_partitioning.csv"),
+  row.names = FALSE
+)
+
+p_2j <- ggplot(perm_df, aes(x = reorder(Variable, R2), y = R2, fill = Variable)) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  geom_text(
+    aes(label = paste0(percent(R2, accuracy = 0.1), "\n", p_label)),
+    vjust = -0.35,
+    size = 3.5
+  ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    x = NULL,
+    y = "Explained variance (R²)",
+    title = "PERMANOVA variance partitioning"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6))
+
+save_pdf_png(p_2j, "Fig2J_PERMANOVA_variance_partitioning", width = 6, height = 4)
+
+############################################################
+## 17. Figure 2K: subtype proportions by region, time, IDH
+############################################################
+
+plot_prop <- function(dat, group_var, title) {
+  dat %>%
+    filter(Region %in% c("TC", "TE"), PredSubtype %in% c("SYN", "IMR", "Mixed")) %>%
+    count(.data[[group_var]], PredSubtype) %>%
+    group_by(.data[[group_var]]) %>%
+    mutate(prop = n / sum(n)) %>%
+    ungroup() %>%
+    ggplot(aes(x = .data[[group_var]], y = prop, fill = PredSubtype)) +
+    geom_col(width = 0.75, color = "white", linewidth = 0.2) +
+    scale_y_continuous(labels = percent_format(accuracy = 1)) +
+    scale_fill_manual(values = sub_cols, drop = FALSE) +
+    labs(x = NULL, y = "Tumor specimens, %", title = title) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = 35, hjust = 1),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6)
+    )
+}
+
+p_region <- plot_prop(pred_cor, "Region", "By anatomical region")
+p_time   <- plot_prop(pred_cor, "TimePoint", "By sampling time point")
+p_idh    <- plot_prop(pred_cor, "IDH", "By IDH status")
+
+p_2k <- p_region + p_time + p_idh + plot_layout(ncol = 3)
+
+save_pdf_png(p_2k, "Fig2K_subtype_proportions_region_time_IDH", width = 11, height = 4)
+
+############################################################
+## 18. Figure S3B-E:
+## Compare SSIcentroid, SSIprog and SSIssg
+############################################################
+
+run_ssgsea <- function(expr, gene_sets) {
+  ## Compatible wrapper for old and new GSVA versions
+  res <- tryCatch(
+    {
+      GSVA::gsva(
+        expr = as.matrix(expr),
+        gset.idx.list = gene_sets,
+        method = "ssgsea",
+        ssgsea.norm = TRUE,
+        min.sz = 10,
+        parallel.sz = 1
+      )
+    },
+    error = function(e) {
+      if ("ssgseaParam" %in% getNamespaceExports("GSVA")) {
+        param <- GSVA::ssgseaParam(
+          exprData = as.matrix(expr),
+          geneSets = gene_sets,
+          normalize = TRUE,
+          minSize = 10
+        )
+        GSVA::gsva(param)
+      } else {
+        stop(e)
+      }
+    }
+  )
+  res
+}
+
+gset <- list(
+  SYN = intersect(syn_genes, rownames(Z_all)),
+  IMR = intersect(imr_genes, rownames(Z_all))
+)
+
+ssg <- run_ssgsea(Z_all, gset)
+
+ssg_df <- t(ssg) %>%
+  as.data.frame() %>%
+  rownames_to_column("Sample") %>%
+  mutate(
+    SYNscore_ssg = as.numeric(scale(SYN)),
+    IMRscore_ssg = as.numeric(scale(IMR)),
+    SSIssg = SYNscore_ssg - IMRscore_ssg
+  )
+
+ssi_joint <- pred_cor %>%
+  dplyr::select(Sample, PredSubtype, Region, TimePoint, IDH, SSIcentroid) %>%
+  left_join(prog_df %>% dplyr::select(Sample, SPS, IMS, SSIprog), by = "Sample") %>%
+  left_join(ssg_df %>% dplyr::select(Sample, SYNscore_ssg, IMRscore_ssg, SSIssg), by = "Sample") %>%
+  filter(Region %in% c("TC", "TE"))
+
+write.csv(
+  ssi_joint,
+  file.path(OUT_TBL_DIR, "FigS3_SSI_joint_centroid_program_ssGSEA.csv"),
+  row.names = FALSE
+)
+
+scatter_with_cor <- function(data, xvar, yvar, xlab, ylab, method = "pearson") {
+  ggplot(data, aes(x = .data[[xvar]], y = .data[[yvar]])) +
+    geom_point(aes(color = PredSubtype), alpha = 0.75, size = 1.8) +
+    geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.6) +
+    ggpubr::stat_cor(method = method, label.x.npc = "left", label.y.npc = "top", size = 3.4) +
+    scale_color_manual(values = sub_cols, drop = FALSE) +
+    labs(x = xlab, y = ylab) +
+    theme_classic(base_size = 12) +
+    theme(
+      legend.position = "none",
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6)
+    )
+}
+
+p_s3c <- scatter_with_cor(
+  ssi_joint,
+  "SSIcentroid",
+  "SSIprog",
+  "SSIcentroid",
+  "SSIprog (SPS − IMS)"
+)
+
+p_s3d <- scatter_with_cor(
+  ssi_joint,
+  "SSIcentroid",
+  "SSIssg",
+  "SSIcentroid",
+  "SSIssg (SYNssGSEA − IMRssGSEA)"
+)
+
+p_s3e <- scatter_with_cor(
+  ssi_joint,
+  "SSIprog",
+  "SSIssg",
+  "SSIprog (SPS − IMS)",
+  "SSIssg (SYNssGSEA − IMRssGSEA)"
+)
+
+p_s3cde <- p_s3c + p_s3d + p_s3e + plot_layout(ncol = 3)
+save_pdf_png(p_s3cde, "FigS3CDE_SSI_axis_concordance", width = 12, height = 4)
+
+## Figure S3H: SSIssg distribution by centroid subtype
+p_s3h <- ssi_joint %>%
+  filter(PredSubtype %in% c("SYN", "IMR", "Mixed")) %>%
+  ggplot(aes(x = PredSubtype, y = SSIssg, fill = PredSubtype)) +
+  geom_violin(alpha = 0.6, color = NA, trim = FALSE) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.9) +
+  geom_jitter(width = 0.12, size = 1.6, alpha = 0.7) +
+  stat_compare_means(comparisons = list(c("SYN", "IMR"), c("SYN", "Mixed"), c("IMR", "Mixed"))) +
+  scale_fill_manual(values = sub_cols, drop = FALSE) +
+  labs(
+    x = NULL,
+    y = "SSIssg",
+    title = "ssGSEA-based SSI across centroid-defined subtypes"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6)
+  )
+
+save_pdf_png(p_s3h, "FigS3H_SSIssg_by_centroid_subtype", width = 5, height = 4)
+
+############################################################
+## 19. Figure S3G: sample-sample Pearson correlation heatmap
+############################################################
+
+make_z_corrected <- function(model_raw, model_cor, mat, hv_top_n = 2000) {
+  genes <- intersect(rownames(mat), model_cor$genes)
+  X <- mat[genes, , drop = FALSE]
+
+  mu <- model_raw$mu[genes]
+  sd <- model_raw$sd[genes]
+  sd[sd == 0 | !is.finite(sd)] <- 1
+
+  z_raw <- sweep(X, 1, mu, "-")
+  z_raw <- sweep(z_raw, 1, sd, "/")
+
+  z_all <- row_z(mat)
+  z_all[is.na(z_all)] <- 0
+
+  sel <- which(gene_symbol(rownames(z_all)) %in% plasma_core)
+
+  ps_all <- rep(0, ncol(mat))
+  names(ps_all) <- colnames(mat)
+
+  if (length(sel) >= 10) {
+    ps_all <- if (isTRUE(model_cor$use_pc1)) {
+      prcomp(t(z_all[sel, , drop = FALSE]), scale. = FALSE)$x[, 1]
+    } else {
+      colMeans(z_all[sel, , drop = FALSE], na.rm = TRUE)
+    }
+    ps_all <- setNames(as.numeric(ps_all), colnames(mat))
+  }
+
+  beta <- model_cor$beta[genes]
+  beta[!is.finite(beta)] <- 0
+
+  z_cor <- z_raw - beta %o% ps_all[colnames(z_raw)]
+
+  rv <- rowVars(z_cor, na.rm = TRUE)
+  hv <- order(rv, decreasing = TRUE)[seq_len(min(hv_top_n, length(rv)))]
+
+  z_cor[hv, , drop = FALSE]
+}
+
+z_cor_hv <- make_z_corrected(centroid_model_raw, centroid_model_cor, protein_mat, hv_top_n)
+cor_mat <- cor(z_cor_hv, use = "pairwise.complete.obs", method = "pearson")
+
+ann_cor <- pred_cor %>%
+  filter(Sample %in% colnames(cor_mat)) %>%
+  mutate(
+    PredSubtype = factor(PredSubtype, levels = c("SYN", "IMR", "Mixed")),
+    Region = factor(Region, levels = c("TC", "TE", "AB", "Unknown")),
+    IDH = factor(IDH, levels = c("IDH-mutant", "IDH-wildtype", "Unknown"))
+  ) %>%
+  arrange(PredSubtype, Region, IDH, Sample)
+
+samps_order <- ann_cor$Sample
+
+ha_cor <- HeatmapAnnotation(
+  Subtype = ann_cor$PredSubtype,
+  Region = ann_cor$Region,
+  IDH = ann_cor$IDH,
+  col = list(
+    Subtype = sub_cols,
+    Region = reg_cols,
+    IDH = idh_cols
+  ),
+  gp = gpar(col = NA),
+  annotation_name_side = "left"
+)
+
+vals <- cor_mat[upper.tri(cor_mat)]
+vals <- vals[is.finite(vals)]
+
+col_fun_cor <- colorRamp2(
+  c(
+    quantile(vals, 0.02, na.rm = TRUE),
+    median(vals, na.rm = TRUE),
+    quantile(vals, 0.98, na.rm = TRUE)
+  ),
+  c("#3B4CC0", "#F7F7F7", "#D7301F")
+)
+
+pdf(file.path(OUT_FIG_DIR, "FigS3G_sample_sample_Pearson_heatmap_plasma_corrected.pdf"), width = 6.5, height = 5.2)
+Heatmap(
+  cor_mat[samps_order, samps_order],
+  name = "Pearson",
+  col = col_fun_cor,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+  top_annotation = ha_cor,
+  rect_gp = gpar(col = NA),
+  column_title = "Sample-sample Pearson correlation after plasma correction"
+)
+dev.off()
+
+############################################################
+## 20. Figure S2A: tissue-composition / QC score heatmap
+############################################################
+
+qc_sets <- list(
+  Plasma = plasma_core,
+  Erythrocyte = c("HBA1", "HBA2", "HBB", "HBD", "ALAS2", "CA1", "CA2"),
+  Platelet = c("PPBP", "PF4", "ITGA2B", "ITGB3", "GP1BA", "GP9"),
+  Blood_cell = c("PTPRC", "LCP1", "TYROBP", "FCER1G"),
+  Astrocyte = c("GFAP", "AQP4", "ALDH1L1", "SLC1A3"),
+  Neuronal = c("RBFOX3", "SYT1", "SYN1", "SYP", "CAMK2A"),
+  Immune = c("C1QA", "C1QB", "C1QC", "CD74", "HLA-DRA"),
+  Endothelial = c("PECAM1", "VWF", "KDR", "CLDN5", "ENG")
+)
+
+qc_score <- map_dfc(qc_sets, function(gs) {
+  gs_use <- intersect(gs, rownames(Z_all))
+  if (length(gs_use) == 0) {
+    rep(NA_real_, ncol(Z_all))
+  } else {
+    colMeans(Z_all[gs_use, , drop = FALSE], na.rm = TRUE)
+  }
+}) %>%
+  as.data.frame()
+
+colnames(qc_score) <- names(qc_sets)
+rownames(qc_score) <- colnames(Z_all)
+
+qc_heat <- qc_score[discovery_samples, , drop = FALSE]
+qc_heat <- t(scale(qc_heat))
+qc_heat[!is.finite(qc_heat)] <- NA
+
+qc_anno_df <- discovery_meta %>%
+  left_join(discovery_label_df, by = "Sample") %>%
+  arrange(match(Sample, colnames(qc_heat)))
+
+ha_qc <- HeatmapAnnotation(
+  Region = qc_anno_df$Region,
+  WHO_grade = qc_anno_df$WHO_grade,
+  IDH = qc_anno_df$IDH,
+  Subtype = qc_anno_df$Subtype,
+  col = list(
+    Region = reg_cols,
+    IDH = idh_cols,
+    Subtype = c(SYN = sub_cols["SYN"], IMR = sub_cols["IMR"])
+  ),
+  gp = gpar(col = NA)
+)
+
+pdf(file.path(OUT_FIG_DIR, "FigS2A_QC_tissue_composition_score_heatmap.pdf"), width = 7, height = 4.5)
+Heatmap(
+  qc_heat,
+  name = "z-score",
+  col = colorRamp2(c(-2, 0, 2), c("#2166AC", "#F7F7F7", "#B2182B")),
+  top_annotation = ha_qc,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  show_column_names = FALSE,
+  column_title = "Sample-level QC and tissue-composition scores"
+)
+dev.off()
+
+############################################################
+## 21. Figure S2G: Cancer Hallmark pathway activity
+############################################################
+
+if (file.exists(PATH_HALLMARK)) {
+  hallmark_sets <- clusterProfiler::read.gmt(PATH_HALLMARK) %>%
+    split(.$gene, .$term)
+
+  ssg_hallmark <- run_ssgsea(Z_all[, discovery_samples, drop = FALSE], hallmark_sets)
+
+  hallmark_z <- t(scale(t(ssg_hallmark)))
+  hallmark_z[!is.finite(hallmark_z)] <- NA
+
+  pdf(file.path(OUT_FIG_DIR, "FigS2G_Hallmark_pathway_activity_heatmap.pdf"), width = 8, height = 7)
+  Heatmap(
+    hallmark_z,
+    name = "z-score",
+    col = colorRamp2(c(-2, 0, 2), c("#2166AC", "#F7F7F7", "#B2182B")),
+    top_annotation = ha,
+    cluster_rows = TRUE,
+    cluster_columns = FALSE,
+    show_column_names = FALSE,
+    column_title = "Cancer Hallmark pathway activity in discovery cohort"
+  )
+  dev.off()
+} else {
+  message("Hallmark GMT file not found. Skipping FigS2G.")
+}
+
+############################################################
+## 22. Figure S2H: multivariable Cox model
+############################################################
+
+## 这里需要真实 OS_event/censor 信息。
+## 如果 metadata 中已有 OS_event，请替换下面这段。
+cox_df <- sample_meta %>%
+  filter(Region == "TC", TimePoint == "Primary") %>%
+  left_join(pred_cor %>% dplyr::select(Sample, PredSubtype), by = "Sample") %>%
+  group_by(PatientID) %>%
+  summarise(
+    OS_time = first_non_na(Survival_time),
+    OS_event = if ("OS_event" %in% names(.)) first_non_na(OS_event) else 1,
+    PredSubtype = first_non_na(as.character(PredSubtype)),
+    WHO_grade = first_non_na(WHO_grade),
+    IDH = first_non_na(IDH),
+    Age = if ("Age" %in% names(.)) first_non_na(Age) else NA,
+    Sex = if ("性别" %in% names(.)) first_non_na(性别) else NA,
+    Radiotherapy = if ("放疗" %in% names(.)) first_non_na(放疗) else NA,
+    Chemotherapy = if ("化疗" %in% names(.)) first_non_na(化疗) else NA,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    OS_time = safe_num(OS_time),
+    OS_event = safe_num(OS_event),
+    PredSubtype = factor(PredSubtype, levels = c("SYN", "IMR", "Mixed")),
+    WHO_grade = factor(WHO_grade),
+    Sex = factor(Sex)
+  ) %>%
+  filter(!is.na(OS_time), !is.na(OS_event), PredSubtype %in% c("SYN", "IMR"))
+
+if (nrow(cox_df) >= 10) {
+  cox_fit <- coxph(
+    Surv(OS_time, OS_event) ~ PredSubtype + WHO_grade + Sex,
+    data = cox_df
+  )
+
+  cox_sum <- broom::tidy(cox_fit, exponentiate = TRUE, conf.int = TRUE)
+
+  write.csv(
+    cox_sum,
+    file.path(OUT_TBL_DIR, "FigS2H_multivariable_Cox_OS.csv"),
+    row.names = FALSE
+  )
+
+  p_cox <- cox_sum %>%
+    mutate(term = fct_reorder(term, estimate)) %>%
+    ggplot(aes(x = estimate, y = term)) +
+    geom_point(size = 2.5) +
+    geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+    geom_vline(xintercept = 1, linetype = "dashed") +
+    scale_x_log10() +
+    labs(
+      x = "Hazard ratio, log scale",
+      y = NULL,
+      title = "Multivariable Cox model for overall survival"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6))
+
+  save_pdf_png(p_cox, "FigS2H_multivariable_Cox_OS", width = 6, height = 4.5)
+} else {
+  message("Too few patients for Cox model. Skipping FigS2H.")
+}
+
+############################################################
+## 23. Figure S3F: alternative classifier cross-validation
+############################################################
+
+cv_data <- disc_for_de_z
+cv_labels <- discovery_label_df$Subtype
+names(cv_labels) <- discovery_label_df$Sample
+
+## Use top 50 DE proteins as features
+feature50 <- deg_df %>%
+  filter(Direction %in% c("SYN", "IMR")) %>%
+  arrange(adj.P.Val) %>%
+  slice_head(n = 50) %>%
+  pull(Symbol)
+
+feature50 <- intersect(feature50, rownames(cv_data))
+X_cv <- t(cv_data[feature50, discovery_label_df$Sample, drop = FALSE])
+X_cv[!is.finite(X_cv)] <- 0
+y_cv <- factor(discovery_label_df$Subtype, levels = c("SYN", "IMR"))
+
+folds <- caret::createFolds(y_cv, k = min(10, length(y_cv)), returnTrain = FALSE)
+
+cv_res <- map_dfr(seq_along(folds), function(i) {
+  test_idx <- folds[[i]]
+  train_idx <- setdiff(seq_along(y_cv), test_idx)
+
+  x_train <- X_cv[train_idx, , drop = FALSE]
+  x_test  <- X_cv[test_idx, , drop = FALSE]
+  y_train <- y_cv[train_idx]
+  y_test  <- y_cv[test_idx]
+
+  ## Elastic-net logistic regression
+  cvfit <- cv.glmnet(
+    x = x_train,
+    y = y_train,
+    family = "binomial",
+    alpha = 0.5,
+    type.measure = "class"
+  )
+
+  prob_enet <- as.numeric(predict(cvfit, newx = x_test, s = "lambda.min", type = "response"))
+  pred_enet <- ifelse(prob_enet > 0.5, levels(y_cv)[2], levels(y_cv)[1]) %>%
+    factor(levels = levels(y_cv))
+
+  roc_enet <- tryCatch(
+    as.numeric(pROC::auc(pROC::roc(y_test, prob_enet, levels = levels(y_cv), quiet = TRUE))),
+    error = function(e) NA_real_
+  )
+
+  ## kNN
+  pred_knn <- class::knn(train = x_train, test = x_test, cl = y_train, k = 3)
+  acc_knn <- mean(pred_knn == y_test)
+
+  tibble(
+    Fold = i,
+    Model = c("Elastic-net", "kNN"),
+    Accuracy = c(mean(pred_enet == y_test), acc_knn),
+    ROC_AUC = c(roc_enet, NA_real_)
+  )
+})
+
+write.csv(
+  cv_res,
+  file.path(OUT_TBL_DIR, "FigS3F_classifier_cross_validation.csv"),
+  row.names = FALSE
+)
+
+p_cv <- cv_res %>%
+  pivot_longer(cols = c(Accuracy, ROC_AUC), names_to = "Metric", values_to = "Value") %>%
+  filter(!is.na(Value)) %>%
+  ggplot(aes(x = Model, y = Value, fill = Model)) +
+  geom_col(
+    data = ~ .x %>% group_by(Model, Metric) %>% summarise(Value = mean(Value), .groups = "drop"),
+    width = 0.65,
+    alpha = 0.7
+  ) +
+  geom_jitter(width = 0.12, size = 2, alpha = 0.8) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(x = NULL, y = "Cross-validation performance") +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6)
+  )
+
+save_pdf_png(p_cv, "FigS3F_alternative_classifier_CV", width = 6, height = 4)
+
+############################################################
+## 24. Figure 2L: external IDH-mutant astrocytoma cohort projection
+############################################################
+
+if (file.exists(PATH_EXTERNAL)) {
+  ext_df <- read.table(
+    PATH_EXTERNAL,
+    header = TRUE,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+
+  ext_mat <- as.matrix(ext_df)
+  storage.mode(ext_mat) <- "double"
+  rownames(ext_mat) <- gene_symbol(rownames(ext_mat))
+
+  ext_pred <- project_centroid_model(
+    centroid_model_cor,
+    ext_mat,
+    tau_margin = tau_margin,
+    tau_r = tau_r
+  )
+
+  ## 如果外部队列有 class 注释，请放在 metadata/external_IDHmut_astrocytoma_metadata.csv
+  path_ext_meta <- file.path(META_DIR, "external_IDHmut_astrocytoma_metadata.csv")
+
+  if (file.exists(path_ext_meta)) {
+    ext_meta <- read.csv(path_ext_meta, stringsAsFactors = FALSE)
+  } else {
+    ext_meta <- tibble(Sample = colnames(ext_mat), ExternalClass = "Unknown")
+  }
+
+  ext_z <- row_z(ext_mat)
+  rownames(ext_z) <- gene_symbol(rownames(ext_z))
+
+  ext_SPS <- program_score(ext_z, intersect(syn_genes, rownames(ext_z)))
+  ext_IMS <- program_score(ext_z, intersect(imr_genes, rownames(ext_z)))
+
+  ext_prog <- tibble(
+    Sample = colnames(ext_z),
+    SPS = as.numeric(ext_SPS),
+    IMS = as.numeric(ext_IMS),
+    SSIprog = SPS - IMS
+  ) %>%
+    left_join(ext_pred %>% dplyr::select(Sample, PredSubtype, SSIcentroid), by = "Sample") %>%
+    left_join(ext_meta, by = "Sample")
+
+  write.csv(
+    ext_prog,
+    file.path(OUT_TBL_DIR, "Fig2L_external_projection_scores.csv"),
+    row.names = FALSE
+  )
+
+  p_2l <- ggplot(ext_prog, aes(x = SPS, y = IMS, color = ExternalClass)) +
+    geom_point(size = 2.5, alpha = 0.85) +
+    stat_ellipse(aes(group = ExternalClass), linetype = "dashed", linewidth = 0.5) +
+    labs(
+      x = "SPS",
+      y = "IMS",
+      title = "External IDH-mutant astrocytoma cohort projection"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6))
+
+  save_pdf_png(p_2l, "Fig2L_external_IDHmut_astrocytoma_projection", width = 5.2, height = 4.2)
+} else {
+  message("External cohort matrix not found. Skipping Fig2L.")
+}
+
+############################################################
+## 25. Figure S3I: composition-filtered SSIprog
+############################################################
+
+composition_scores <- qc_score[colnames(Z_all), , drop = FALSE]
+
+sig_all <- unique(c(syn_genes, imr_genes))
+sig_all <- intersect(sig_all, rownames(Z_all))
+
+corr_to_composition <- map_dfr(sig_all, function(g) {
+  y <- Z_all[g, ]
+  tibble(
+    Symbol = g,
+    max_abs_cor = max(
+      abs(apply(composition_scores, 2, function(x) {
+        suppressWarnings(cor(y, x, method = "spearman", use = "pairwise.complete.obs"))
+      })),
+      na.rm = TRUE
+    )
+  )
+})
+
+filtered_syn <- setdiff(syn_genes, corr_to_composition$Symbol[corr_to_composition$max_abs_cor > 0.5])
+filtered_imr <- setdiff(imr_genes, corr_to_composition$Symbol[corr_to_composition$max_abs_cor > 0.5])
+
+SPS_filtered <- program_score(Z_all, intersect(filtered_syn, rownames(Z_all)))
+IMS_filtered <- program_score(Z_all, intersect(filtered_imr, rownames(Z_all)))
+
+filtered_df <- tibble(
+  Sample = colnames(Z_all),
+  SSIprog = as.numeric(SPS - IMS),
+  SSIprog_filtered = as.numeric(SPS_filtered - IMS_filtered)
+) %>%
+  left_join(pred_cor %>% dplyr::select(Sample, Region, TimePoint, PredSubtype), by = "Sample") %>%
+  filter(Region %in% c("TC", "TE"))
+
+p_s3i <- ggplot(filtered_df, aes(x = SSIprog, y = SSIprog_filtered, color = Region, shape = TimePoint)) +
+  geom_point(size = 2.2, alpha = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.6) +
+  stat_cor(method = "spearman", label.x.npc = "left", label.y.npc = "top") +
+  scale_color_manual(values = reg_cols, drop = FALSE) +
+  labs(
+    x = "Original SSIprog",
+    y = "Composition-filtered SSIprog",
+    title = "Concordance after removing composition-correlated signature proteins"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6))
+
+save_pdf_png(p_s3i, "FigS3I_composition_filtered_SSIprog", width = 5.2, height = 4.2)
+
+write.csv(
+  filtered_df,
+  file.path(OUT_TBL_DIR, "FigS3I_composition_filtered_SSIprog.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 26. Figure 2A and Figure 2M
+############################################################
+
+## Figure 2A:
+## 建议作为 Illustrator / BioRender 流程图。
+## 本脚本输出用于绘图的关键数据表。
+
+fig2a_summary <- tibble(
+  Item = c(
+    "Discovery set",
+    "Discovery method",
+    "Centroid classifier",
+    "Program score",
+    "Full cohort projection",
+    "External validation"
+  ),
+  Description = c(
+    paste0(length(discovery_samples), " primary TC proteomes"),
+    "NMF and consensus clustering",
+    "SYN and IMR centroids with plasma correction",
+    "SPS, IMS and SSIprog = SPS - IMS",
+    paste0(nrow(pred_cor), " tissue specimens projected"),
+    ifelse(file.exists(PATH_EXTERNAL), "External IDH-mutant astrocytoma cohort available", "External cohort not provided")
+  )
+)
+
+write.csv(
+  fig2a_summary,
+  file.path(OUT_TBL_DIR, "Fig2A_schematic_summary.csv"),
+  row.names = FALSE
+)
+
+## Figure 2M:
+## mIF representative images should not be generated from the proteomic matrix.
+## 建议单独保存原始图像、marker、exposure、scale bar 信息。
+## 这里仅生成一个 metadata 模板。
+
+mif_template <- tibble(
+  Specimen = character(),
+  Subtype = character(),
+  Marker = character(),
+  Image_file = character(),
+  Exposure_setting = character(),
+  Scale_bar_um = numeric()
+)
+
+write.csv(
+  mif_template,
+  file.path(OUT_TBL_DIR, "Fig2M_mIF_image_metadata_template.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 27. Session information
+############################################################
+
+sink(file.path(OUT_TBL_DIR, "Fig2_sessionInfo.txt"))
+sessionInfo()
+sink()
+
+message("Figure 2 / Figure S2 / Figure S3 pipeline finished.")
